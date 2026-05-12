@@ -356,16 +356,16 @@ impl App {
                 }
                 return Action::None;
             }
+            KeyCode::Char('p') => {
+                return Action::ConfigWebDavDownload;
+            }
+            KeyCode::Char('P') => {
+                return Action::ConfigWebDavUpload;
+            }
             KeyCode::Char('q') | KeyCode::Esc => {
                 return self.on_back_key();
             }
             _ => {}
-        }
-
-        if matches!(self.route, Route::Main)
-            && matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P'))
-        {
-            return self.main_proxy_action(data);
         }
 
         // Navigation + route-specific actions.
@@ -472,7 +472,6 @@ impl App {
             Route::SettingsProxy => self.on_settings_proxy_key(key, data),
             Route::Main => match key.code {
                 KeyCode::Char('r') => Action::LocalEnvRefresh,
-                KeyCode::Char('p') | KeyCode::Char('P') => self.main_proxy_action(data),
                 _ => Action::None,
             },
         }

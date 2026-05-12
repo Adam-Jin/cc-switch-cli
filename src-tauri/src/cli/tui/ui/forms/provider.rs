@@ -210,7 +210,9 @@ pub(crate) fn render_provider_add_form(
     }
 
     if matches!(provider.app_type, AppType::Codex) {
-        let provider_json_value = provider.to_provider_json_value();
+        let provider_json_value = provider
+            .to_provider_json_value_with_common_config(&data.config.common_snippet)
+            .unwrap_or_else(|_| provider.to_provider_json_value());
         let settings_value = provider_json_value
             .get("settingsConfig")
             .cloned()

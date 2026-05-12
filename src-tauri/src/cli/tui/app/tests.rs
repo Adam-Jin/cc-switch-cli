@@ -7145,7 +7145,7 @@ mod tests {
         data.proxy.listen_address = "127.0.0.1".to_string();
         data.proxy.listen_port = 15721;
 
-        let action = app.on_key(key(KeyCode::Char('p')), &data);
+        let action = app.main_proxy_action(&data);
         assert!(matches!(
             action,
             Action::SetManagedProxyForCurrentApp {
@@ -7166,7 +7166,7 @@ mod tests {
         data.proxy.listen_address = "127.0.0.1".to_string();
         data.proxy.listen_port = 15721;
 
-        let action = app.on_key(key(KeyCode::Char('p')), &data);
+        let action = app.main_proxy_action(&data);
         assert!(matches!(
             action,
             Action::SetManagedProxyForCurrentApp {
@@ -7188,7 +7188,7 @@ mod tests {
         data.proxy.listen_address = "127.0.0.1".to_string();
         data.proxy.listen_port = 15721;
 
-        let action = app.on_key(key(KeyCode::Char('p')), &data);
+        let action = app.main_proxy_action(&data);
         assert!(matches!(
             action,
             Action::SetManagedProxyForCurrentApp {
@@ -7210,7 +7210,7 @@ mod tests {
         data.proxy.listen_address = "127.0.0.1".to_string();
         data.proxy.listen_port = 15721;
 
-        let action = app.on_key(key(KeyCode::Char('p')), &data);
+        let action = app.main_proxy_action(&data);
         assert!(matches!(action, Action::None));
     }
 
