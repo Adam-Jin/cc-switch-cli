@@ -1230,6 +1230,7 @@ fn mcp_add_form_builds_sse_server_without_stdio_fields() {
 #[test]
 fn mcp_env_form_restores_sorted_rows() {
     let server = crate::app_config::McpServer {
+        machine_selector: Default::default(),
         id: "m1".to_string(),
         name: "Server One".to_string(),
         server: json!({
@@ -1363,6 +1364,7 @@ fn mcp_http_form_replaces_stdio_fields_with_url() {
 #[test]
 fn mcp_form_restores_remote_server_type_and_url() {
     let server = crate::app_config::McpServer {
+        machine_selector: Default::default(),
         id: "docs-langchain".to_string(),
         name: "LangChain Docs".to_string(),
         server: json!({
@@ -1395,6 +1397,7 @@ fn mcp_form_restores_remote_server_type_and_url() {
 #[test]
 fn mcp_form_infers_http_only_when_url_has_no_type() {
     let server = crate::app_config::McpServer {
+        machine_selector: Default::default(),
         id: "docs-langchain".to_string(),
         name: "LangChain Docs".to_string(),
         server: json!({
@@ -1411,6 +1414,7 @@ fn mcp_form_infers_http_only_when_url_has_no_type() {
     assert_eq!(form.server_type, McpTransport::Http);
 
     let server = crate::app_config::McpServer {
+        machine_selector: Default::default(),
         server: json!({
             "type": "websocket",
             "url": "https://docs.langchain.com/mcp"

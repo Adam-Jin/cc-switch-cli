@@ -663,6 +663,7 @@ impl SkillService {
                     index.skills.insert(
                         directory.clone(),
                         InstalledSkill {
+                            machine_selector: Default::default(),
                             id: format!("local:{directory}"),
                             name,
                             description,
@@ -790,9 +791,17 @@ impl SkillService {
             return Ok(());
         }
 
+        // 当前机器的有效标签集，用于按 machine_selector 过滤是否在本机生效。
+        let labels = crate::machine::current_labels()?;
+
         for skill in index.skills.values() {
-            if skill.apps.is_enabled_for(app) {
+            let active_here =
+                skill.apps.is_enabled_for(app) && skill.machine_selector.matches(&labels);
+            if active_here {
                 Self::sync_to_app_dir(&skill.directory, app, index.sync_method)?;
+            } else {
+                // 未启用或本机不匹配：主动 unlink，清理可能残留的旧链接/副本。
+                Self::remove_from_app(&skill.directory, app)?;
             }
         }
         Ok(())
@@ -924,6 +933,34 @@ impl SkillService {
         }
 
         Self::save_index(&index)?;
+        Ok(())
+    }
+
+    /// 设置某个 Skill 的机器作用域选择器，并按新规则重新同步到各应用目录。
+    pub fn set_machine_selector(
+        directory_or_id: &str,
+        selector: crate::app_config::MachineSelector,
+    ) -> Result<(), AppError> {
+        let mut index = Self::load_index()?;
+        let Some(dir) = Self::resolve_directory_from_input(&index, directory_or_id) else {
+            return Err(AppError::Message(format!(
+                "未找到已安装的 Skill: {directory_or_id}"
+            )));
+        };
+
+        let Some(record) = index.skills.get_mut(&dir) else {
+            return Err(AppError::Message(format!("未找到已安装的 Skill: {dir}")));
+        };
+
+        record.machine_selector = selector;
+        Self::save_index(&index)?;
+
+        // 按 (启用状态 ∧ 本机匹配) 重新落地/清理所有支持的应用目录。
+        for app in Self::supported_skill_apps() {
+            if let Err(e) = Self::sync_to_app(&index, &app) {
+                log::warn!("重新同步 Skill 到 {app:?} 失败: {e}");
+            }
+        }
         Ok(())
     }
 
@@ -1072,6 +1109,7 @@ impl SkillService {
         }
 
         let installed = InstalledSkill {
+            machine_selector: Default::default(),
             id: discoverable.key.clone(),
             name: discoverable.name.clone(),
             description: if discoverable.description.trim().is_empty() {
@@ -1239,6 +1277,7 @@ impl SkillService {
                 build_repo_info_from_lock(&agents_lock, &dir_name);
 
             let skill = InstalledSkill {
+                machine_selector: Default::default(),
                 id,
                 name,
                 description,

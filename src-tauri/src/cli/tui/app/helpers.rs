@@ -1172,6 +1172,38 @@ pub(crate) fn four_app_picker_index(app_type: &AppType) -> usize {
     app_type_picker_index(app_type).min(3)
 }
 
+/// 机器作用域 selector 编辑框的提示文案（附带本机当前标签作为参考）。
+pub(crate) fn machine_selector_prompt(labels: &std::collections::BTreeSet<String>) -> String {
+    let here = if labels.is_empty() {
+        crate::t!("none", "无").to_string()
+    } else {
+        labels.iter().cloned().collect::<Vec<_>>().join(" ")
+    };
+    format!(
+        "{}\n{} {}",
+        crate::t!(
+            "Space-separated labels. `!label` excludes. Empty = all machines.",
+            "空格分隔的标签；`!标签` 表示排除；留空 = 所有机器。"
+        ),
+        crate::t!("This machine:", "本机标签："),
+        here
+    )
+}
+
+/// 本机手动标签编辑框的提示文案（os/arch 为自动标签，此处只编辑手动标签）。
+pub(crate) fn machine_labels_prompt() -> String {
+    let auto = crate::machine::auto_labels().join(" ");
+    format!(
+        "{}\n{} {}",
+        crate::t!(
+            "Space-separated custom labels for this machine (e.g. work home).",
+            "本机自定义标签，空格分隔（如 work home）。"
+        ),
+        crate::t!("Auto labels:", "自动标签："),
+        auto
+    )
+}
+
 pub(crate) fn app_type_for_picker_index(index: usize) -> AppType {
     match index {
         1 => AppType::Codex,

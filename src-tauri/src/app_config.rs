@@ -1,8 +1,75 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::str::FromStr;
 
 use crate::services::skill::SkillStore;
+
+/// 机器作用域选择器：决定某个 MCP/Skill 在「当前机器」是否生效。
+///
+/// 跟随条目定义一起通过 WebDAV 同步（所有机器都看得到同一份规则），
+/// 但只在「当前机器的标签集」与规则匹配时才真正写出/落地。
+///
+/// 匹配语义：`(include 为空 || 标签命中任一 include) && (不命中任何 exclude)`。
+/// 空选择器（include/exclude 均空）= 所有机器生效（向后兼容默认值）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct MachineSelector {
+    /// 命中其一即满足（OR）。为空表示不限制。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub include: Vec<String>,
+    /// 命中任一即排除（优先级高于 include）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude: Vec<String>,
+}
+
+impl MachineSelector {
+    /// 是否为空选择器（即对所有机器生效）。
+    pub fn is_empty(&self) -> bool {
+        self.include.is_empty() && self.exclude.is_empty()
+    }
+
+    /// 给定当前机器的有效标签集，判断本条目是否在该机器生效。
+    pub fn matches(&self, labels: &BTreeSet<String>) -> bool {
+        if self.exclude.iter().any(|l| labels.contains(l)) {
+            return false;
+        }
+        if self.include.is_empty() {
+            return true;
+        }
+        self.include.iter().any(|l| labels.contains(l))
+    }
+
+    /// 序列化为单行编辑串：include 标签原样、exclude 标签加 `!` 前缀，空格分隔。
+    /// 例：`os:linux os:macos !home`。空选择器返回空串。
+    pub fn to_edit_string(&self) -> String {
+        let mut parts = Vec::with_capacity(self.include.len() + self.exclude.len());
+        parts.extend(self.include.iter().cloned());
+        parts.extend(self.exclude.iter().map(|l| format!("!{l}")));
+        parts.join(" ")
+    }
+
+    /// 解析单行编辑串（空白或逗号分隔，`!` 前缀表示 exclude）。
+    /// 自动去空白、去重；同一标签在 include/exclude 同时出现时以 exclude 为准。
+    pub fn parse_edit_string(input: &str) -> Self {
+        let mut include = Vec::new();
+        let mut exclude = Vec::new();
+        for token in input.split([' ', ',', '\t', '\n']) {
+            let token = token.trim();
+            if token.is_empty() {
+                continue;
+            }
+            if let Some(rest) = token.strip_prefix('!') {
+                let rest = rest.trim();
+                if !rest.is_empty() && !exclude.iter().any(|e| e == rest) {
+                    exclude.push(rest.to_string());
+                }
+            } else if !include.iter().any(|i| i == token) {
+                include.push(token.to_string());
+            }
+        }
+        include.retain(|i| !exclude.iter().any(|e| e == i));
+        Self { include, exclude }
+    }
+}
 
 /// MCP 服务器应用状态（标记应用到哪些客户端）
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -155,6 +222,9 @@ pub struct InstalledSkill {
     pub readme_url: Option<String>,
     /// 应用启用状态
     pub apps: SkillApps,
+    /// 机器作用域选择器（为空 = 所有机器生效）
+    #[serde(default, skip_serializing_if = "MachineSelector::is_empty")]
+    pub machine_selector: MachineSelector,
     /// 安装时间（Unix 时间戳）
     pub installed_at: i64,
 }
@@ -189,6 +259,9 @@ pub struct McpServer {
     pub docs: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// 机器作用域选择器（为空 = 所有机器生效）
+    #[serde(default, skip_serializing_if = "MachineSelector::is_empty")]
+    pub machine_selector: MachineSelector,
 }
 
 /// MCP 配置：单客户端维度（v3.6.x 及以前，保留用于向后兼容）
@@ -821,6 +894,7 @@ impl MultiAppConfig {
                     unified_servers.insert(
                         id.clone(),
                         McpServer {
+                            machine_selector: Default::default(),
                             id: id.clone(),
                             name,
                             server,

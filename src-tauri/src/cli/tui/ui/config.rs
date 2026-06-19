@@ -2393,6 +2393,25 @@ pub(super) fn render_settings(
                 texts::tui_settings_visible_apps_label().to_string(),
                 visible_apps_summary(&visible_apps),
             ),
+            super::app::SettingsItem::MachineLabels => {
+                (crate::t!("Machine labels", "本机标签").to_string(), {
+                    let auto: std::collections::BTreeSet<String> =
+                        crate::machine::auto_labels().into_iter().collect();
+                    let manual = crate::machine::current_labels()
+                        .map(|labels| {
+                            labels
+                                .into_iter()
+                                .filter(|l| !auto.contains(l))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    if manual.is_empty() {
+                        crate::t!("(none)", "（无）").to_string()
+                    } else {
+                        manual.join(" ")
+                    }
+                })
+            }
             super::app::SettingsItem::OpenClawConfigDir => (
                 texts::tui_settings_openclaw_config_dir_label().to_string(),
                 openclaw_config_dir.clone().unwrap_or_else(|| {

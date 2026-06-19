@@ -33,6 +33,7 @@ pub(super) fn render_skills_installed(
                 ("Enter", texts::tui_key_details()),
                 ("x", texts::tui_key_toggle()),
                 ("m", texts::tui_key_apps()),
+                ("s", crate::t!("scope", "作用域")),
                 ("f", texts::tui_key_discover()),
                 ("i", texts::tui_skills_action_import_existing()),
                 ("d", texts::tui_key_uninstall()),
@@ -58,13 +59,27 @@ pub(super) fn render_skills_installed(
     .style(Style::default().fg(theme.dim).add_modifier(Modifier::BOLD));
 
     let rows = visible.iter().map(|skill| {
-        Row::new(vec![
-            Cell::from(skill_display_name(&skill.name, &skill.directory).to_string()),
+        let scoped = !skill.machine_selector.is_empty();
+        let active_here = skill.machine_selector.matches(&app.machine_labels);
+        let base = skill_display_name(&skill.name, &skill.directory).to_string();
+        let name = if !scoped {
+            base
+        } else if active_here {
+            format!("{base} ⊙")
+        } else {
+            format!("{base} ⊘")
+        };
+        let mut r = Row::new(vec![
+            Cell::from(name),
             Cell::from(skill_marker(skill.apps.claude)),
             Cell::from(skill_marker(skill.apps.codex)),
             Cell::from(skill_marker(skill.apps.gemini)),
             Cell::from(skill_marker(skill.apps.opencode)),
-        ])
+        ]);
+        if scoped && !active_here {
+            r = r.style(Style::default().fg(theme.dim));
+        }
+        r
     });
 
     let table = Table::new(

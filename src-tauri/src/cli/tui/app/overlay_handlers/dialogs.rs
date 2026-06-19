@@ -252,6 +252,22 @@ impl App {
             }
             TextSubmit::WebDavJianguoyunUsername => self.handle_webdav_username_submit(raw),
             TextSubmit::WebDavJianguoyunPassword => self.handle_webdav_password_submit(raw),
+            TextSubmit::McpMachineSelector { id } => Action::McpSetMachineSelector {
+                id,
+                selector: crate::app_config::MachineSelector::parse_edit_string(&raw),
+            },
+            TextSubmit::SkillsMachineSelector { directory } => Action::SkillsSetMachineSelector {
+                directory,
+                selector: crate::app_config::MachineSelector::parse_edit_string(&raw),
+            },
+            TextSubmit::MachineLabels => Action::MachineLabelsSet {
+                labels: raw
+                    .split([' ', ',', '\t'])
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect(),
+            },
         }
     }
 

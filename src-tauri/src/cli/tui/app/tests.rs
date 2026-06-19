@@ -234,6 +234,7 @@ mod tests {
         data.skills
             .installed
             .push(crate::services::skill::InstalledSkill {
+                machine_selector: Default::default(),
                 id: "local:hello-skill".to_string(),
                 name: "Hello Skill".to_string(),
                 description: None,
@@ -269,6 +270,7 @@ mod tests {
         data.skills
             .installed
             .push(crate::services::skill::InstalledSkill {
+                machine_selector: Default::default(),
                 id: "local:hello-skill".to_string(),
                 name: "Hello Skill".to_string(),
                 description: None,
@@ -308,6 +310,7 @@ mod tests {
         data.skills
             .installed
             .push(crate::services::skill::InstalledSkill {
+                machine_selector: Default::default(),
                 id: "local:hello-skill".to_string(),
                 name: "Hello Skill".to_string(),
                 description: None,
@@ -350,6 +353,7 @@ mod tests {
         data.skills
             .installed
             .push(crate::services::skill::InstalledSkill {
+                machine_selector: Default::default(),
                 id: "local:hello-skill".to_string(),
                 name: "Hello Skill".to_string(),
                 description: None,
@@ -1801,6 +1805,7 @@ mod tests {
         data.mcp.rows.push(super::super::data::McpRow {
             id: "m1".to_string(),
             server: crate::app_config::McpServer {
+                machine_selector: Default::default(),
                 id: "m1".to_string(),
                 name: "Server".to_string(),
                 server: json!({}),
@@ -1858,6 +1863,7 @@ mod tests {
         data.mcp.rows.push(super::super::data::McpRow {
             id: "m1".to_string(),
             server: crate::app_config::McpServer {
+                machine_selector: Default::default(),
                 id: "m1".to_string(),
                 name: "Server".to_string(),
                 server: json!({}),
@@ -1892,6 +1898,7 @@ mod tests {
         data.mcp.rows.push(super::super::data::McpRow {
             id: "m1".to_string(),
             server: crate::app_config::McpServer {
+                machine_selector: Default::default(),
                 id: "m1".to_string(),
                 name: "Server".to_string(),
                 server: json!({}),
@@ -1929,6 +1936,7 @@ mod tests {
         data.mcp.rows.push(super::super::data::McpRow {
             id: "m1".to_string(),
             server: crate::app_config::McpServer {
+                machine_selector: Default::default(),
                 id: "m1".to_string(),
                 name: "Server".to_string(),
                 server: json!({}),
@@ -1970,6 +1978,7 @@ mod tests {
         data.mcp.rows.push(super::super::data::McpRow {
             id: "m1".to_string(),
             server: crate::app_config::McpServer {
+                machine_selector: Default::default(),
                 id: "m1".to_string(),
                 name: "Server".to_string(),
                 server: json!({}),
@@ -2011,6 +2020,7 @@ mod tests {
         data.mcp.rows.push(super::super::data::McpRow {
             id: "m1".to_string(),
             server: crate::app_config::McpServer {
+                machine_selector: Default::default(),
                 id: "m1".to_string(),
                 name: "Server".to_string(),
                 server: json!({"command":"foo","args":[]}),
@@ -8768,6 +8778,7 @@ mod tests {
         data.mcp.rows.push(super::super::data::McpRow {
             id: "m1".to_string(),
             server: crate::app_config::McpServer {
+                machine_selector: Default::default(),
                 id: "m1".to_string(),
                 name: "Server".to_string(),
                 server: json!({"command":"foo","args":[]}),
@@ -8811,6 +8822,7 @@ mod tests {
         data.mcp.rows.push(super::super::data::McpRow {
             id: "m1".to_string(),
             server: crate::app_config::McpServer {
+                machine_selector: Default::default(),
                 id: "m1".to_string(),
                 name: "Server".to_string(),
                 server: json!({"command":"foo","args":[]}),

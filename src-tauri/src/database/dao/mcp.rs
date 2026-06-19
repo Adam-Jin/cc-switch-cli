@@ -13,7 +13,7 @@ impl Database {
     pub fn get_all_mcp_servers(&self) -> Result<IndexMap<String, McpServer>, AppError> {
         let conn = lock_conn!(self.conn);
         let mut stmt = conn.prepare(
-            "SELECT id, name, server_config, description, homepage, docs, tags, enabled_claude, enabled_codex, enabled_gemini, enabled_opencode, enabled_hermes
+            "SELECT id, name, server_config, description, homepage, docs, tags, enabled_claude, enabled_codex, enabled_gemini, enabled_opencode, enabled_hermes, machine_selector
              FROM mcp_servers
              ORDER BY name ASC, id ASC"
         ).map_err(|e| AppError::Database(e.to_string()))?;
@@ -32,9 +32,12 @@ impl Database {
                 let enabled_gemini: bool = row.get(9)?;
                 let enabled_opencode: bool = row.get(10)?;
                 let enabled_hermes: bool = row.get(11)?;
+                let machine_selector_str: String = row.get(12)?;
 
                 let server = serde_json::from_str(&server_config_str).unwrap_or_default();
                 let tags = serde_json::from_str(&tags_str).unwrap_or_default();
+                let machine_selector =
+                    serde_json::from_str(&machine_selector_str).unwrap_or_default();
 
                 Ok((
                     id.clone(),
@@ -53,6 +56,7 @@ impl Database {
                         homepage,
                         docs,
                         tags,
+                        machine_selector,
                     },
                 ))
             })
@@ -72,8 +76,9 @@ impl Database {
         conn.execute(
             "INSERT INTO mcp_servers (
                 id, name, server_config, description, homepage, docs, tags,
-                enabled_claude, enabled_codex, enabled_gemini, enabled_opencode, enabled_hermes
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                enabled_claude, enabled_codex, enabled_gemini, enabled_opencode, enabled_hermes,
+                machine_selector
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 server_config = excluded.server_config,
@@ -85,7 +90,8 @@ impl Database {
                 enabled_codex = excluded.enabled_codex,
                 enabled_gemini = excluded.enabled_gemini,
                 enabled_opencode = excluded.enabled_opencode,
-                enabled_hermes = excluded.enabled_hermes",
+                enabled_hermes = excluded.enabled_hermes,
+                machine_selector = excluded.machine_selector",
             params![
                 server.id,
                 server.name,
@@ -102,6 +108,9 @@ impl Database {
                 server.apps.gemini,
                 server.apps.opencode,
                 server.apps.hermes,
+                serde_json::to_string(&server.machine_selector).map_err(|e| AppError::Database(
+                    format!("Failed to serialize machine selector: {e}")
+                ))?,
             ],
         )
         .map_err(|e| AppError::Database(e.to_string()))?;

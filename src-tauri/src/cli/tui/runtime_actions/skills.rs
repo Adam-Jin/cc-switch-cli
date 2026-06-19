@@ -60,6 +60,19 @@ pub(super) fn set_apps(
     Ok(())
 }
 
+pub(super) fn set_machine_selector(
+    ctx: &mut RuntimeActionContext<'_>,
+    directory: String,
+    selector: crate::app_config::MachineSelector,
+) -> Result<(), AppError> {
+    SkillService::set_machine_selector(&directory, selector)?;
+    ctx.app.refresh_machine_labels();
+    *ctx.data = super::super::data::UiData::load(&ctx.app.app_type)?;
+    ctx.app
+        .push_toast(texts::tui_toast_skill_apps_updated(), ToastKind::Success);
+    Ok(())
+}
+
 pub(super) fn install(ctx: &mut RuntimeActionContext<'_>, spec: String) -> Result<(), AppError> {
     let Some(tx) = ctx.skills_req_tx else {
         return Err(AppError::Message(

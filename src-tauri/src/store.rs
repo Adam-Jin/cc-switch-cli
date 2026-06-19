@@ -364,6 +364,7 @@ fn load_skills_index_for_migration(
         }
         let installed_at = state.installed_at.timestamp();
         let record = InstalledSkill {
+            machine_selector: Default::default(),
             id: format!("local:{directory}"),
             name: directory.clone(),
             description: None,

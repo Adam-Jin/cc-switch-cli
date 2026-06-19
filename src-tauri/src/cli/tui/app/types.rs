@@ -107,6 +107,16 @@ pub enum TextSubmit {
     },
     WebDavJianguoyunUsername,
     WebDavJianguoyunPassword,
+    /// 编辑某个 MCP 服务器的机器作用域选择器（单行 mini 语法）
+    McpMachineSelector {
+        id: String,
+    },
+    /// 编辑某个 Skill 的机器作用域选择器（单行 mini 语法）
+    SkillsMachineSelector {
+        directory: String,
+    },
+    /// 编辑本机手动标签（空格分隔）
+    MachineLabels,
 }
 
 #[derive(Debug, Clone)]

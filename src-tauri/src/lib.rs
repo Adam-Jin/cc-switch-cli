@@ -12,6 +12,7 @@ mod gemini_config;
 mod gemini_mcp;
 mod import_export;
 mod init_status;
+mod machine;
 mod mcp;
 mod openclaw_config;
 mod opencode_config;

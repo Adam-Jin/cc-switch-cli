@@ -297,6 +297,7 @@ fn add_server(_app_type: AppType) -> Result<(), AppError> {
     apps.set_enabled_for(&_app_type, true);
 
     let template = McpServer {
+        machine_selector: Default::default(),
         id: String::new(),
         name: String::new(),
         server: serde_json::json!({

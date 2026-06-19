@@ -562,6 +562,7 @@ fn openclaw_provider_row(id: &str, name: &str, models: &[(&str, &str)]) -> Provi
 
 fn installed_skill(directory: &str, name: &str) -> InstalledSkill {
     InstalledSkill {
+        machine_selector: Default::default(),
         id: format!("local:{directory}"),
         name: name.to_string(),
         description: Some("Demo".to_string()),
@@ -1399,6 +1400,7 @@ fn home_connection_card_labels_mcp_and_skills_with_active_counts() {
     let mut data = minimal_data(&app.app_type);
     data.skills.installed = vec![
         crate::app_config::InstalledSkill {
+            machine_selector: Default::default(),
             id: "local:skill-a".to_string(),
             name: "Skill A".to_string(),
             description: None,
@@ -1416,6 +1418,7 @@ fn home_connection_card_labels_mcp_and_skills_with_active_counts() {
             installed_at: 0,
         },
         crate::app_config::InstalledSkill {
+            machine_selector: Default::default(),
             id: "local:skill-b".to_string(),
             name: "Skill B".to_string(),
             description: None,
@@ -2234,6 +2237,7 @@ fn mcp_page_renders_opencode_column() {
     data.mcp.rows = vec![super::super::data::McpRow {
         id: "m1".to_string(),
         server: crate::app_config::McpServer {
+            machine_selector: Default::default(),
             id: "m1".to_string(),
             name: "Server".to_string(),
             server: json!({}),
@@ -2314,6 +2318,7 @@ fn mcp_page_shows_summary_bar() {
         super::super::data::McpRow {
             id: "m1".to_string(),
             server: crate::app_config::McpServer {
+                machine_selector: Default::default(),
                 id: "m1".to_string(),
                 name: "Server 1".to_string(),
                 server: json!({}),
@@ -2333,6 +2338,7 @@ fn mcp_page_shows_summary_bar() {
         super::super::data::McpRow {
             id: "m2".to_string(),
             server: crate::app_config::McpServer {
+                machine_selector: Default::default(),
                 id: "m2".to_string(),
                 name: "Server 2".to_string(),
                 server: json!({}),

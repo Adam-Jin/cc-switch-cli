@@ -126,8 +126,16 @@ impl McpService {
 
     /// 将 MCP 服务器同步到所有启用的应用
     fn sync_server_to_apps(state: &AppState, server: &McpServer) -> Result<(), AppError> {
-        let cfg = state.config.read()?;
+        // 本机不匹配 selector：从所有启用应用的 live 配置中移除，而不是写入。
+        let labels = crate::machine::current_labels_with(&state.db)?;
+        if !server.machine_selector.matches(&labels) {
+            for app in server.apps.enabled_apps() {
+                Self::remove_server_from_app(state, &server.id, &app)?;
+            }
+            return Ok(());
+        }
 
+        let cfg = state.config.read()?;
         for app in server.apps.enabled_apps() {
             Self::sync_server_to_app_internal(&cfg, server, &app)?;
         }
@@ -195,6 +203,8 @@ impl McpService {
     /// 手动同步所有启用的 MCP 服务器到对应的应用
     pub fn sync_all_enabled(state: &AppState) -> Result<(), AppError> {
         let servers = Self::get_all_servers(state)?;
+        // 当前机器的有效标签集，用于按 machine_selector 过滤是否在本机生效。
+        let labels = crate::machine::current_labels_with(&state.db)?;
 
         for app in AppType::all() {
             if matches!(app, AppType::OpenClaw) {
@@ -202,7 +212,9 @@ impl McpService {
             }
 
             for server in servers.values() {
-                if server.apps.is_enabled_for(&app) {
+                let active_here =
+                    server.apps.is_enabled_for(&app) && server.machine_selector.matches(&labels);
+                if active_here {
                     Self::sync_server_to_app(state, server, &app)?;
                 } else {
                     Self::remove_server_from_app(state, &server.id, &app)?;

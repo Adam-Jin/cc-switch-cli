@@ -84,6 +84,30 @@ pub(super) fn set_apps(
     Ok(())
 }
 
+pub(super) fn set_machine_selector(
+    ctx: &mut RuntimeActionContext<'_>,
+    id: String,
+    selector: crate::app_config::MachineSelector,
+) -> Result<(), AppError> {
+    let state = load_state()?;
+    let servers = McpService::get_all_servers(&state)?;
+    let Some(mut server) = servers.get(&id).cloned() else {
+        ctx.app
+            .push_toast(texts::tui_toast_mcp_server_not_found(), ToastKind::Warning);
+        return Ok(());
+    };
+
+    server.machine_selector = selector;
+    // upsert 会持久化并按 selector 重新同步（本机不匹配则从 live 配置移除）。
+    McpService::upsert_server(&state, server)?;
+
+    ctx.app
+        .push_toast(texts::tui_toast_mcp_updated(), ToastKind::Success);
+    ctx.app.refresh_machine_labels();
+    *ctx.data = UiData::load(&ctx.app.app_type)?;
+    Ok(())
+}
+
 pub(super) fn delete(ctx: &mut RuntimeActionContext<'_>, id: String) -> Result<(), AppError> {
     let state = load_state()?;
     let deleted = McpService::delete_server(&state, &id)?;

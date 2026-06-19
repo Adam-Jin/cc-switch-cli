@@ -24,7 +24,8 @@ const SYNC_IMPORT_RESTORE_TABLES: &[&str] = &[
 
 const SYNC_EXPORT_RESETTABLE_TABLES: &[&str] = &["provider_health"];
 
-const SYNC_LOCAL_SETTINGS_KEYS: &[&str] = &["proxy_runtime_session"];
+const SYNC_LOCAL_SETTINGS_KEYS: &[&str] =
+    &["proxy_runtime_session", crate::machine::MACHINE_LABELS_KEY];
 const PROXY_CONFIG_LOCAL_COLUMNS: &[&str] =
     &["proxy_enabled", "listen_address", "listen_port", "enabled"];
 

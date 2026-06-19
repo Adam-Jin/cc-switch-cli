@@ -386,6 +386,7 @@ pub fn import_from_claude(config: &mut MultiAppConfig) -> Result<usize, AppError
             servers.insert(
                 id.clone(),
                 McpServer {
+                    machine_selector: Default::default(),
                     id: id.clone(),
                     name: id.clone(),
                     server: spec.clone(),
@@ -612,6 +613,7 @@ pub fn import_from_codex(config: &mut MultiAppConfig) -> Result<usize, AppError>
                 servers.insert(
                     id.clone(),
                     McpServer {
+                        machine_selector: Default::default(),
                         id: id.clone(),
                         name: id.clone(),
                         server: spec_v,
@@ -775,6 +777,7 @@ pub fn import_from_gemini(config: &mut MultiAppConfig) -> Result<usize, AppError
             servers.insert(
                 id.clone(),
                 McpServer {
+                    machine_selector: Default::default(),
                     id: id.clone(),
                     name: id.clone(),
                     server: spec.clone(),
@@ -944,6 +947,7 @@ pub fn import_from_opencode(config: &mut MultiAppConfig) -> Result<usize, AppErr
             servers.insert(
                 id.clone(),
                 McpServer {
+                    machine_selector: Default::default(),
                     id: id.clone(),
                     name: id.clone(),
                     server: unified,

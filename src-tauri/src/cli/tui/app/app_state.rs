@@ -8,6 +8,10 @@ pub enum Action {
     Quit,
     SetAppType(AppType),
     LocalEnvRefresh,
+    /// 设置本机手动标签（机器作用域 selector 的匹配依据之一）
+    MachineLabelsSet {
+        labels: Vec<String>,
+    },
 
     SkillsToggle {
         directory: String,
@@ -16,6 +20,10 @@ pub enum Action {
     SkillsSetApps {
         directory: String,
         apps: crate::app_config::SkillApps,
+    },
+    SkillsSetMachineSelector {
+        directory: String,
+        selector: crate::app_config::MachineSelector,
     },
     SkillsInstall {
         spec: String,
@@ -98,6 +106,10 @@ pub enum Action {
     McpSetApps {
         id: String,
         apps: crate::app_config::McpApps,
+    },
+    McpSetMachineSelector {
+        id: String,
+        selector: crate::app_config::MachineSelector,
     },
     McpDelete {
         id: String,
@@ -357,6 +369,7 @@ impl ConfigItem {
 pub enum SettingsItem {
     Language,
     VisibleApps,
+    MachineLabels,
     OpenClawConfigDir,
     SkipClaudeOnboarding,
     ClaudePluginIntegration,
@@ -365,9 +378,10 @@ pub enum SettingsItem {
 }
 
 impl SettingsItem {
-    pub const ALL: [SettingsItem; 7] = [
+    pub const ALL: [SettingsItem; 8] = [
         SettingsItem::Language,
         SettingsItem::VisibleApps,
+        SettingsItem::MachineLabels,
         SettingsItem::OpenClawConfigDir,
         SettingsItem::SkipClaudeOnboarding,
         SettingsItem::ClaudePluginIntegration,
@@ -493,4 +507,7 @@ pub struct App {
     pub language_idx: usize,
     pub settings_idx: usize,
     pub settings_proxy_idx: usize,
+    /// 当前机器的有效标签集缓存（os/arch + 本机手动标签）。
+    /// 用于列表渲染时判断 MCP/Skill 是否在本机生效。启动与编辑标签后刷新。
+    pub machine_labels: std::collections::BTreeSet<String>,
 }

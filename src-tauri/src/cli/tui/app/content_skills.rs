@@ -78,6 +78,21 @@ impl App {
                 Action::None
             }
             KeyCode::Char('i') => Action::SkillsOpenImport,
+            KeyCode::Char('s') => {
+                let Some(skill) = visible.get(self.skills_idx) else {
+                    return Action::None;
+                };
+                self.overlay = Overlay::TextInput(TextInputState {
+                    title: crate::t!("Skill machine scope", "Skill 机器作用域").to_string(),
+                    prompt: machine_selector_prompt(&self.machine_labels),
+                    input: TextInput::new(skill.machine_selector.to_edit_string()),
+                    submit: TextSubmit::SkillsMachineSelector {
+                        directory: skill.directory.clone(),
+                    },
+                    secret: false,
+                });
+                Action::None
+            }
             KeyCode::Char('f') => self.push_route_and_switch(Route::SkillsDiscover),
             _ => Action::None,
         }

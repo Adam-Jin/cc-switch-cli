@@ -6,6 +6,30 @@ use super::super::data::{load_proxy_config, load_state, UiData};
 use super::helpers::open_proxy_help_overlay_with;
 use super::RuntimeActionContext;
 
+pub(super) fn set_machine_labels(
+    ctx: &mut RuntimeActionContext<'_>,
+    labels: Vec<String>,
+) -> Result<(), AppError> {
+    let state = load_state()?;
+    crate::machine::set_machine_labels(&state.db, &labels)?;
+
+    // 标签变化后，按新作用域重新评估并落地 MCP / Skill（本机不再匹配的会被移除）。
+    if let Err(e) = crate::services::McpService::sync_all_enabled(&state) {
+        log::warn!("更新本机标签后重新同步 MCP 失败: {e}");
+    }
+    if let Err(e) = crate::services::SkillService::sync_all_enabled_best_effort() {
+        log::warn!("更新本机标签后重新同步 Skill 失败: {e}");
+    }
+
+    ctx.app.refresh_machine_labels();
+    *ctx.data = UiData::load(&ctx.app.app_type)?;
+    ctx.app.push_toast(
+        crate::t!("Machine labels updated.", "本机标签已更新。"),
+        super::super::app::ToastKind::Success,
+    );
+    Ok(())
+}
+
 pub(super) fn set_proxy_enabled(
     ctx: &mut RuntimeActionContext<'_>,
     enabled: bool,

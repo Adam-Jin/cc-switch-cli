@@ -328,6 +328,19 @@ impl App {
                 Action::None
             }
             KeyCode::Char('i') => Action::McpImport,
+            KeyCode::Char('s') => {
+                let Some(row) = visible.get(self.mcp_idx) else {
+                    return Action::None;
+                };
+                self.overlay = Overlay::TextInput(TextInputState {
+                    title: crate::t!("MCP machine scope", "MCP 机器作用域").to_string(),
+                    prompt: machine_selector_prompt(&self.machine_labels),
+                    input: TextInput::new(row.server.machine_selector.to_edit_string()),
+                    submit: TextSubmit::McpMachineSelector { id: row.id.clone() },
+                    secret: false,
+                });
+                Action::None
+            }
             KeyCode::Char('d') => {
                 let Some(row) = visible.get(self.mcp_idx) else {
                     return Action::None;

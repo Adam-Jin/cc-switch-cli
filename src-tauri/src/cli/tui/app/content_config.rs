@@ -702,6 +702,28 @@ impl App {
                     };
                     Action::None
                 }
+                Some(SettingsItem::MachineLabels) => {
+                    let current = crate::machine::current_labels()
+                        .ok()
+                        .map(|labels| {
+                            let auto: std::collections::BTreeSet<String> =
+                                crate::machine::auto_labels().into_iter().collect();
+                            labels
+                                .into_iter()
+                                .filter(|l| !auto.contains(l))
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        })
+                        .unwrap_or_default();
+                    self.overlay = Overlay::TextInput(TextInputState {
+                        title: crate::t!("Machine labels", "本机标签").to_string(),
+                        prompt: machine_labels_prompt(),
+                        input: TextInput::new(current),
+                        submit: TextSubmit::MachineLabels,
+                        secret: false,
+                    });
+                    Action::None
+                }
                 Some(SettingsItem::OpenClawConfigDir) => {
                     let buffer = crate::settings::get_settings()
                         .openclaw_config_dir

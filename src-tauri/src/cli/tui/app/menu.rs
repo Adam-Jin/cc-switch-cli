@@ -62,7 +62,13 @@ impl App {
             language_idx: 0,
             settings_idx: 0,
             settings_proxy_idx: 0,
+            machine_labels: crate::machine::auto_labels().into_iter().collect(),
         }
+    }
+
+    /// 重新计算当前机器的有效标签集缓存。
+    pub(crate) fn refresh_machine_labels(&mut self) {
+        self.machine_labels = crate::machine::current_labels().unwrap_or_default();
     }
 
     pub fn nav_item(&self) -> NavItem {

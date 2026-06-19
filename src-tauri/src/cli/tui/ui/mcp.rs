@@ -33,8 +33,17 @@ pub(super) fn render_mcp(
     .style(Style::default().fg(theme.dim).add_modifier(Modifier::BOLD));
 
     let rows = visible.iter().map(|row| {
-        Row::new(vec![
-            Cell::from(row.server.name.clone()),
+        let scoped = !row.server.machine_selector.is_empty();
+        let active_here = row.server.machine_selector.matches(&app.machine_labels);
+        let name = if !scoped {
+            row.server.name.clone()
+        } else if active_here {
+            format!("{} ⊙", row.server.name)
+        } else {
+            format!("{} ⊘", row.server.name)
+        };
+        let mut r = Row::new(vec![
+            Cell::from(name),
             Cell::from(if row.server.apps.claude {
                 texts::tui_marker_active()
             } else {
@@ -55,7 +64,12 @@ pub(super) fn render_mcp(
             } else {
                 texts::tui_marker_inactive()
             }),
-        ])
+        ]);
+        // 当前机器不匹配 selector：灰显整行，提示本机不生效。
+        if scoped && !active_here {
+            r = r.style(Style::default().fg(theme.dim));
+        }
+        r
     });
 
     let outer = Block::default()
@@ -83,6 +97,7 @@ pub(super) fn render_mcp(
             &[
                 ("x", texts::tui_key_toggle()),
                 ("m", texts::tui_key_apps()),
+                ("s", crate::t!("scope", "作用域")),
                 ("a", texts::tui_key_add()),
                 ("e", texts::tui_key_edit()),
                 ("i", texts::tui_mcp_action_import_existing()),

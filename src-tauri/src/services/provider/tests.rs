@@ -205,6 +205,7 @@ fn setup_switched_codex_state_with_managed_mcp() -> (TempDir, EnvGuard, AppState
     config.mcp.servers.as_mut().expect("mcp servers").insert(
         "my_server".to_string(),
         crate::app_config::McpServer {
+            machine_selector: Default::default(),
             id: "my_server".to_string(),
             name: "My Server".to_string(),
             server: json!({

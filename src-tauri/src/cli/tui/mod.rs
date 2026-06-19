@@ -209,6 +209,8 @@ pub fn run(app_override: Option<AppType>) -> Result<(), AppError> {
     let _panic_hook = PanicRestoreHookGuard::install();
     let mut terminal = TuiTerminal::new()?;
     let (mut app, mut data) = initialize_app_state_with(app_override, data::UiData::load)?;
+    // 启动后从 DB 读取本机手动标签，补全 machine_labels 缓存（new() 仅含 os/arch 自动标签）。
+    app.refresh_machine_labels();
     let mut proxy_open_flash = ProxyOpenFlash::default();
     app.reset_proxy_activity(
         data.proxy.estimated_input_tokens_total,

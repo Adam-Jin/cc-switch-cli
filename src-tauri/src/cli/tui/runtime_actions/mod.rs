@@ -151,6 +151,7 @@ pub(crate) fn handle_action(
             apply_preloaded_app_switch(ctx.app, ctx.data, next, next_data);
             Ok(())
         }
+        Action::MachineLabelsSet { labels } => settings::set_machine_labels(&mut ctx, labels),
         Action::LocalEnvRefresh => {
             let Some(tx) = ctx.local_env_req_tx else {
                 ctx.app.local_env_loading = false;
@@ -181,6 +182,10 @@ pub(crate) fn handle_action(
         }
         Action::SkillsToggle { directory, enabled } => skills::toggle(&mut ctx, directory, enabled),
         Action::SkillsSetApps { directory, apps } => skills::set_apps(&mut ctx, directory, apps),
+        Action::SkillsSetMachineSelector {
+            directory,
+            selector,
+        } => skills::set_machine_selector(&mut ctx, directory, selector),
         Action::SkillsInstall { spec } => skills::install(&mut ctx, spec),
         Action::SkillsUninstall { directory } => skills::uninstall(&mut ctx, directory),
         Action::SkillsSync { app: scope } => skills::sync(&mut ctx, scope),
@@ -234,6 +239,9 @@ pub(crate) fn handle_action(
         } => providers::model_fetch(&mut ctx, base_url, api_key, field, claude_idx),
         Action::McpToggle { id, enabled } => mcp::toggle(&mut ctx, id, enabled),
         Action::McpSetApps { id, apps } => mcp::set_apps(&mut ctx, id, apps),
+        Action::McpSetMachineSelector { id, selector } => {
+            mcp::set_machine_selector(&mut ctx, id, selector)
+        }
         Action::McpDelete { id } => mcp::delete(&mut ctx, id),
         Action::McpImport => mcp::import_current_app(&mut ctx),
         Action::PromptActivate { id } => prompts::activate(&mut ctx, id),

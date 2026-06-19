@@ -22,13 +22,14 @@ impl Database {
         let mut stmt = conn
             .prepare(
                 "SELECT id, name, description, directory, repo_owner, repo_name, repo_branch,
-                        readme_url, enabled_claude, enabled_codex, enabled_gemini, enabled_opencode, installed_at
+                        readme_url, enabled_claude, enabled_codex, enabled_gemini, enabled_opencode, installed_at, machine_selector
                  FROM skills ORDER BY name ASC",
             )
             .map_err(|e| AppError::Database(e.to_string()))?;
 
         let skill_iter = stmt
             .query_map([], |row| {
+                let machine_selector_str: String = row.get(13)?;
                 Ok(InstalledSkill {
                     id: row.get(0)?,
                     name: row.get(1)?,
@@ -44,6 +45,8 @@ impl Database {
                         gemini: row.get(10)?,
                         opencode: row.get(11)?,
                     },
+                    machine_selector: serde_json::from_str(&machine_selector_str)
+                        .unwrap_or_default(),
                     installed_at: row.get(12)?,
                 })
             })
@@ -63,12 +66,13 @@ impl Database {
         let mut stmt = conn
             .prepare(
                 "SELECT id, name, description, directory, repo_owner, repo_name, repo_branch,
-                        readme_url, enabled_claude, enabled_codex, enabled_gemini, enabled_opencode, installed_at
+                        readme_url, enabled_claude, enabled_codex, enabled_gemini, enabled_opencode, installed_at, machine_selector
                  FROM skills WHERE id = ?1",
             )
             .map_err(|e| AppError::Database(e.to_string()))?;
 
         let result = stmt.query_row([id], |row| {
+            let machine_selector_str: String = row.get(13)?;
             Ok(InstalledSkill {
                 id: row.get(0)?,
                 name: row.get(1)?,
@@ -84,6 +88,7 @@ impl Database {
                     gemini: row.get(10)?,
                     opencode: row.get(11)?,
                 },
+                machine_selector: serde_json::from_str(&machine_selector_str).unwrap_or_default(),
                 installed_at: row.get(12)?,
             })
         });
@@ -101,8 +106,8 @@ impl Database {
         conn.execute(
             "INSERT OR REPLACE INTO skills
              (id, name, description, directory, repo_owner, repo_name, repo_branch,
-              readme_url, enabled_claude, enabled_codex, enabled_gemini, enabled_opencode, installed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+              readme_url, enabled_claude, enabled_codex, enabled_gemini, enabled_opencode, installed_at, machine_selector)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 skill.id,
                 skill.name,
@@ -117,6 +122,9 @@ impl Database {
                 skill.apps.gemini,
                 skill.apps.opencode,
                 skill.installed_at,
+                serde_json::to_string(&skill.machine_selector).map_err(|e| AppError::Database(
+                    format!("Failed to serialize machine selector: {e}")
+                ))?,
             ],
         )
         .map_err(|e| AppError::Database(e.to_string()))?;
