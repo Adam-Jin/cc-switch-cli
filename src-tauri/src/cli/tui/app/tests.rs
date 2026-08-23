@@ -9882,11 +9882,66 @@ mod tests {
     }
 
     #[test]
-    fn global_webdav_shortcuts_download_and_upload() {
+    fn global_cloud_shortcuts_prefer_s3_and_fall_back_to_webdav() {
         let mut app = App::new(Some(AppType::Claude));
         app.route = Route::Settings;
-        let data = UiData::default();
+        let mut data = UiData::default();
 
+        assert!(matches!(
+            app.on_key(key(KeyCode::Char('g')), &data),
+            Action::None
+        ));
+        assert!(matches!(
+            app.on_key(key(KeyCode::Char('G')), &data),
+            Action::None
+        ));
+
+        data.config.webdav_sync = Some(crate::settings::WebDavSyncSettings {
+            enabled: true,
+            base_url: "https://dav.example.com".to_string(),
+            ..crate::settings::WebDavSyncSettings::default()
+        });
+
+        assert!(matches!(
+            app.on_key(key(KeyCode::Char('g')), &data),
+            Action::ConfigWebDavDownload
+        ));
+        assert!(matches!(
+            app.on_key(key(KeyCode::Char('G')), &data),
+            Action::ConfigWebDavUpload
+        ));
+
+        data.config.s3_sync = Some(crate::settings::S3SyncSettings {
+            enabled: true,
+            ..crate::settings::S3SyncSettings::default()
+        });
+        assert!(matches!(
+            app.on_key(key(KeyCode::Char('g')), &data),
+            Action::ConfigWebDavDownload
+        ));
+        assert!(matches!(
+            app.on_key(key(KeyCode::Char('G')), &data),
+            Action::ConfigWebDavUpload
+        ));
+
+        data.config.s3_sync = Some(crate::settings::S3SyncSettings {
+            enabled: true,
+            region: "us-east-1".to_string(),
+            bucket: "cc-switch".to_string(),
+            access_key_id: "access-key".to_string(),
+            secret_access_key: "secret-key".to_string(),
+            ..crate::settings::S3SyncSettings::default()
+        });
+        assert!(matches!(
+            app.on_key(key(KeyCode::Char('g')), &data),
+            Action::ConfigS3Download
+        ));
+        assert!(matches!(
+            app.on_key(key(KeyCode::Char('G')), &data),
+            Action::ConfigS3Upload
+        ));
+
+        data.config.s3_sync.as_mut().expect("S3 config").enabled = false;
         assert!(matches!(
             app.on_key(key(KeyCode::Char('g')), &data),
             Action::ConfigWebDavDownload

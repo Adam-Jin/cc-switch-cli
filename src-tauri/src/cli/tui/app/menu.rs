@@ -868,13 +868,45 @@ impl App {
             KeyCode::Char('q') | KeyCode::Esc => {
                 return self.on_back_key();
             }
-            // Global WebDAV snapshot transfer shortcuts. Keep these outside
+            // Global cloud snapshot transfer shortcuts. Keep these outside
             // route-specific handlers so they remain available from any page.
             KeyCode::Char('g') => {
-                return Action::ConfigWebDavDownload;
+                if data
+                    .config
+                    .s3_sync
+                    .as_ref()
+                    .is_some_and(|settings| settings.enabled && settings.validate().is_ok())
+                {
+                    return Action::ConfigS3Download;
+                }
+                if data
+                    .config
+                    .webdav_sync
+                    .as_ref()
+                    .is_some_and(|settings| settings.enabled && settings.validate().is_ok())
+                {
+                    return Action::ConfigWebDavDownload;
+                }
+                return Action::None;
             }
             KeyCode::Char('G') => {
-                return Action::ConfigWebDavUpload;
+                if data
+                    .config
+                    .s3_sync
+                    .as_ref()
+                    .is_some_and(|settings| settings.enabled && settings.validate().is_ok())
+                {
+                    return Action::ConfigS3Upload;
+                }
+                if data
+                    .config
+                    .webdav_sync
+                    .as_ref()
+                    .is_some_and(|settings| settings.enabled && settings.validate().is_ok())
+                {
+                    return Action::ConfigWebDavUpload;
+                }
+                return Action::None;
             }
             _ => {}
         }
