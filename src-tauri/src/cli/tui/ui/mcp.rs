@@ -29,20 +29,19 @@ pub(super) fn render_mcp(
         Cell::from(crate::app_config::AppType::Codex.as_str()),
         Cell::from(crate::app_config::AppType::Gemini.as_str()),
         Cell::from(crate::app_config::AppType::OpenCode.as_str()),
+        Cell::from(crate::app_config::AppType::Hermes.as_str()),
     ])
     .style(Style::default().fg(theme.dim).add_modifier(Modifier::BOLD));
 
     let rows = visible.iter().map(|row| {
         let scoped = !row.server.machine_selector.is_empty();
         let active_here = row.server.machine_selector.matches(&app.machine_labels);
-        let name = if !scoped {
-            row.server.name.clone()
-        } else if active_here {
-            format!("{} ⊙", row.server.name)
+        let name = if scoped && !active_here {
+            format!("{} {}", row.server.name, texts::tui_marker_inactive())
         } else {
-            format!("{} ⊘", row.server.name)
+            row.server.name.clone()
         };
-        let mut r = Row::new(vec![
+        Row::new(vec![
             Cell::from(name),
             Cell::from(if row.server.apps.claude {
                 texts::tui_marker_active()
@@ -64,48 +63,20 @@ pub(super) fn render_mcp(
             } else {
                 texts::tui_marker_inactive()
             }),
-        ]);
-        // 当前机器不匹配 selector：灰显整行，提示本机不生效。
-        if scoped && !active_here {
-            r = r.style(Style::default().fg(theme.dim));
-        }
-        r
+            Cell::from(if row.server.apps.hermes {
+                texts::tui_marker_active()
+            } else {
+                texts::tui_marker_inactive()
+            }),
+        ])
+        .style(if scoped && !active_here {
+            Style::default().fg(theme.dim)
+        } else {
+            Style::default()
+        })
     });
 
-    let outer = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Plain)
-        .border_style(pane_border_style(app, Focus::Content, theme))
-        .title(texts::menu_manage_mcp());
-    frame.render_widget(outer.clone(), area);
-    let inner = outer.inner(area);
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Length(3),
-            Constraint::Min(0),
-        ])
-        .split(inner);
-
-    if app.focus == Focus::Content {
-        render_key_bar_center(
-            frame,
-            chunks[0],
-            theme,
-            &[
-                ("x", texts::tui_key_toggle()),
-                ("m", texts::tui_key_apps()),
-                ("s", crate::t!("scope", "作用域")),
-                ("a", texts::tui_key_add()),
-                ("e", texts::tui_key_edit()),
-                ("i", texts::tui_mcp_action_import_existing()),
-                ("d", texts::tui_key_delete()),
-            ],
-        );
-    }
-
+    let keys = crate::cli::tui::keymap::mcp::key_bar_items(app, data);
     let summary = texts::tui_mcp_server_counts(
         data.mcp
             .rows
@@ -127,8 +98,21 @@ pub(super) fn render_mcp(
             .iter()
             .filter(|row| row.server.apps.opencode)
             .count(),
+        data.mcp
+            .rows
+            .iter()
+            .filter(|row| row.server.apps.hermes)
+            .count(),
     );
-    render_summary_bar(frame, chunks[1], theme, summary);
+    let body = render_page_frame(
+        frame,
+        area,
+        theme,
+        app,
+        texts::menu_manage_mcp(),
+        &keys,
+        Some(summary),
+    );
 
     let table = Table::new(
         rows,
@@ -138,6 +122,7 @@ pub(super) fn render_mcp(
             Constraint::Length(8),
             Constraint::Length(8),
             Constraint::Length(10),
+            Constraint::Length(8),
         ],
     )
     .header(header)
@@ -145,8 +130,19 @@ pub(super) fn render_mcp(
     .row_highlight_style(selection_style(theme))
     .highlight_symbol(highlight_symbol(theme));
 
+    if data.mcp.rows.is_empty() {
+        render_empty_state(
+            frame,
+            body,
+            theme,
+            texts::tui_mcp_empty_title(),
+            texts::tui_mcp_empty_subtitle(),
+        );
+        return;
+    }
+
     let mut state = TableState::default();
     state.select(Some(app.mcp_idx));
 
-    frame.render_stateful_widget(table, inset_left(chunks[2], CONTENT_INSET_LEFT), &mut state);
+    frame.render_stateful_widget(table, inset_left(body, CONTENT_INSET_LEFT), &mut state);
 }

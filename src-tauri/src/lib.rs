@@ -1,49 +1,74 @@
+// The library exposes a curated facade. Without the CLI, shared modules retain
+// private helpers that are only reached by CLI workflows.
+#![cfg_attr(not(feature = "cli"), allow(dead_code))]
+
 // Core modules
 mod app_config;
 mod claude_mcp;
+mod claude_model_config;
 mod claude_plugin;
 mod codex_config;
+mod codex_history_migration;
+mod codex_state_db;
 pub mod commands;
 mod config;
+#[cfg(unix)]
+pub mod daemon;
 mod database;
 mod deeplink;
 mod error;
 mod gemini_config;
 mod gemini_mcp;
+pub mod hermes_config;
 mod import_export;
+#[allow(dead_code)]
 mod init_status;
 mod machine;
 mod mcp;
+mod model_capabilities;
 mod openclaw_config;
 mod opencode_config;
 mod prompt;
 mod prompt_files;
 mod provider;
 mod provider_defaults;
+mod provider_preset_models;
+mod provider_preset_sponsors;
 mod proxy;
 mod services;
+mod session_manager;
 mod settings;
 mod store;
 mod sync_policy;
+mod usage_events;
 mod usage_script;
 
 #[cfg(test)]
 pub(crate) mod test_support;
 
+// Localized validation text is also used by the library-only build.
+#[path = "cli/i18n.rs"]
+pub mod i18n;
+
 // CLI module
+#[cfg(feature = "cli")]
 pub mod cli;
 
 // Public exports
-pub use app_config::{AppType, McpApps, McpServer, MultiAppConfig};
+pub use app_config::{AppType, McpApps, McpServer, MultiAppConfig, SkillApps};
 pub use claude_plugin::{
     sync_claude_plugin_on_provider_switch, sync_claude_plugin_on_settings_toggle,
 };
 pub use codex_config::{get_codex_auth_path, get_codex_config_path, write_codex_live_atomic};
 pub use config::{
     get_app_config_dir, get_claude_mcp_path, get_claude_settings_path, read_json_file,
+    validate_config_dir,
 };
 pub use database::{Database, FailoverQueueItem};
-pub use deeplink::{import_provider_from_deeplink, parse_deeplink_url, DeepLinkImportRequest};
+pub use deeplink::{
+    import_mcp_from_deeplink, import_prompt_from_deeplink, import_provider_from_deeplink,
+    import_skill_from_deeplink, parse_deeplink_url, DeepLinkImportRequest, McpImportResult,
+};
 pub use error::AppError;
 pub use import_export::export_config_to_file;
 pub use mcp::{
@@ -52,19 +77,21 @@ pub use mcp::{
     sync_enabled_to_codex, sync_enabled_to_gemini, sync_single_server_to_claude,
     sync_single_server_to_codex, sync_single_server_to_gemini,
 };
-pub use provider::{Provider, ProviderMeta};
+pub use provider::{Provider, ProviderMeta, UsageScript};
 pub use proxy::{ProxyConfig, ProxyServerInfo, ProxyStatus};
 pub use services::{
-    AuthService, ConfigService, CredentialStatus, EndpointLatency, ExtraUsage, HealthStatus,
+    reapply_current_codex_official_live, AuthService, ConfigService, CredentialStatus,
+    EndpointLatency, ExtraUsage, GlobalOutboundProxyConfig, HealthStatus, ImportSkillSelection,
     ManagedAuthAccount, ManagedAuthDeviceCodeResponse, ManagedAuthStatus, McpService,
-    PromptService, ProviderService, ProxyService, QuotaTier, SkillService, SpeedtestService,
-    StreamCheckConfig, StreamCheckResult, StreamCheckService, SubscriptionQuota, SyncDecision,
-    WebDavSyncService, WebDavSyncSummary,
+    PromptService, ProviderService, ProxyService, QuotaTier, S3RemoteInfo, S3SyncService,
+    S3SyncSummary, SkillService, SpeedtestService, StreamCheckConfig, StreamCheckResult,
+    StreamCheckService, SubscriptionQuota, SyncDecision, WebDavSyncService, WebDavSyncSummary,
 };
 pub use settings::{
-    get_enable_claude_plugin_integration, get_skip_claude_onboarding, get_webdav_sync_settings,
-    set_enable_claude_plugin_integration, set_skip_claude_onboarding, set_webdav_sync_settings,
-    update_settings, update_webdav_sync_status, webdav_jianguoyun_preset, AppSettings,
+    get_enable_claude_plugin_integration, get_s3_sync_settings, get_skip_claude_onboarding,
+    get_webdav_sync_settings, set_enable_claude_plugin_integration, set_s3_sync_settings,
+    set_skip_claude_onboarding, set_webdav_sync_settings, update_s3_sync_status, update_settings,
+    update_webdav_sync_status, webdav_jianguoyun_preset, AppSettings, S3SyncSettings,
     WebDavSyncSettings, WebDavSyncStatus,
 };
 pub use store::AppState;

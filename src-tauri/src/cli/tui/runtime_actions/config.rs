@@ -1,15 +1,22 @@
+use std::path::Path;
+use std::process::Command;
+
 use crate::app_config::AppType;
 use crate::cli::i18n::texts;
 use crate::commands::workspace;
 use crate::error::AppError;
-use crate::services::{ConfigService, ProviderService};
-use crate::settings::set_webdav_sync_settings;
+use crate::hermes_config::MemoryKind;
+use crate::services::ConfigService;
+use crate::settings::{
+    get_s3_sync_settings, get_webdav_sync_settings, set_s3_sync_settings, set_webdav_sync_settings,
+    S3SyncSettings, WebDavSyncSettings,
+};
 
 use super::super::app::{LoadingKind, Overlay, TextViewState, ToastKind};
 use super::super::data::{load_state, UiData};
 use super::super::runtime_systems::{WebDavReq, WebDavReqKind};
 use super::helpers::{
-    export_target, open_proxy_help as open_proxy_help_overlay, refresh_common_snippet_overlay,
+    export_target, open_proxy_help as open_proxy_help_overlay,
     refresh_openclaw_daily_memory_search_results, refresh_openclaw_workspace_data,
 };
 use super::RuntimeActionContext;
@@ -149,54 +156,123 @@ pub(super) fn open_proxy_help(ctx: &mut RuntimeActionContext<'_>) -> Result<(), 
     open_proxy_help_overlay(ctx.app, ctx.data)
 }
 
-pub(super) fn clear_common_snippet(
-    ctx: &mut RuntimeActionContext<'_>,
-    app_type: AppType,
-) -> Result<(), AppError> {
-    let state = load_state()?;
-    ProviderService::clear_common_config_snippet(&state, app_type)?;
-
-    ctx.app
-        .push_toast(texts::common_config_snippet_cleared(), ToastKind::Success);
-    *ctx.data = UiData::load(&ctx.app.app_type)?;
-    refresh_common_snippet_overlay(ctx.app, ctx.data);
-    Ok(())
-}
-
-pub(super) fn apply_common_snippet(
-    ctx: &mut RuntimeActionContext<'_>,
-    app_type: AppType,
-) -> Result<(), AppError> {
-    if app_type.is_additive_mode() {
-        ctx.app.push_toast(
-            texts::common_config_snippet_apply_not_needed(),
-            ToastKind::Info,
-        );
-        return Ok(());
-    }
-
-    let state = load_state()?;
-    let current_id = ProviderService::current(&state, app_type.clone())?;
-    if current_id.trim().is_empty() {
-        ctx.app.push_toast(
-            texts::common_config_snippet_no_current_provider(),
-            ToastKind::Info,
-        );
-        return Ok(());
-    }
-    ProviderService::switch(&state, app_type.clone(), &current_id)?;
-    ctx.app
-        .push_toast(texts::common_config_snippet_applied(), ToastKind::Success);
-    *ctx.data = UiData::load(&ctx.app.app_type)?;
-    Ok(())
-}
-
 pub(super) fn webdav_check_connection(ctx: &mut RuntimeActionContext<'_>) -> Result<(), AppError> {
     queue_webdav_request(
         ctx,
         WebDavReqKind::CheckConnection,
         texts::tui_webdav_loading_title_check_connection().to_string(),
     )
+}
+
+pub(super) fn webdav_save(
+    ctx: &mut RuntimeActionContext<'_>,
+    mut settings: WebDavSyncSettings,
+) -> Result<(), AppError> {
+    settings.auto_sync = false;
+    set_webdav_sync_settings(Some(settings))?;
+    ctx.app.form = None;
+    *ctx.data = UiData::load(&ctx.app.app_type)?;
+    ctx.app
+        .push_toast(texts::tui_toast_webdav_settings_saved(), ToastKind::Success);
+    webdav_check_connection(ctx)
+}
+
+pub(super) fn webdav_set_enabled(
+    ctx: &mut RuntimeActionContext<'_>,
+    enabled: bool,
+) -> Result<(), AppError> {
+    let mut settings = get_webdav_sync_settings()
+        .ok_or_else(|| AppError::Message(texts::tui_webdav_status_not_configured().to_string()))?;
+    settings.enabled = enabled;
+    settings.auto_sync = false;
+    set_webdav_sync_settings(Some(settings))?;
+    *ctx.data = UiData::load(&ctx.app.app_type)?;
+    ctx.app.push_toast(
+        texts::tui_cloud_sync_backend_state_changed("WebDAV", enabled),
+        ToastKind::Success,
+    );
+    Ok(())
+}
+
+pub(super) fn s3_save(
+    ctx: &mut RuntimeActionContext<'_>,
+    mut settings: S3SyncSettings,
+) -> Result<(), AppError> {
+    settings.auto_sync = false;
+    set_s3_sync_settings(Some(settings))?;
+    ctx.app.form = None;
+    *ctx.data = UiData::load(&ctx.app.app_type)?;
+    ctx.app
+        .push_toast(texts::tui_toast_s3_settings_saved(), ToastKind::Success);
+    s3_check_connection(ctx)
+}
+
+pub(super) fn s3_check_connection(ctx: &mut RuntimeActionContext<'_>) -> Result<(), AppError> {
+    queue_s3_request(
+        ctx,
+        WebDavReqKind::S3CheckConnection,
+        texts::tui_s3_loading_title_check_connection().to_string(),
+    )
+}
+
+pub(super) fn s3_fetch_remote_info(
+    ctx: &mut RuntimeActionContext<'_>,
+    intent: super::super::app::CloudSyncTransferIntent,
+) -> Result<(), AppError> {
+    let title = match intent {
+        super::super::app::CloudSyncTransferIntent::Upload => {
+            texts::tui_s3_loading_title_prepare_upload()
+        }
+        super::super::app::CloudSyncTransferIntent::Restore => {
+            texts::tui_s3_loading_title_prepare_restore()
+        }
+    };
+    queue_s3_request(
+        ctx,
+        WebDavReqKind::S3FetchRemoteInfo { intent },
+        title.to_string(),
+    )
+}
+
+pub(super) fn s3_upload(ctx: &mut RuntimeActionContext<'_>) -> Result<(), AppError> {
+    queue_s3_request(
+        ctx,
+        WebDavReqKind::S3Upload,
+        texts::tui_s3_loading_title_upload().to_string(),
+    )
+}
+
+pub(super) fn s3_download(ctx: &mut RuntimeActionContext<'_>) -> Result<(), AppError> {
+    queue_s3_request(
+        ctx,
+        WebDavReqKind::S3Download,
+        texts::tui_s3_loading_title_restore().to_string(),
+    )
+}
+
+pub(super) fn s3_set_enabled(
+    ctx: &mut RuntimeActionContext<'_>,
+    enabled: bool,
+) -> Result<(), AppError> {
+    let mut settings = get_s3_sync_settings()
+        .ok_or_else(|| AppError::Message(texts::tui_webdav_status_not_configured().to_string()))?;
+    settings.enabled = enabled;
+    settings.auto_sync = false;
+    set_s3_sync_settings(Some(settings))?;
+    *ctx.data = UiData::load(&ctx.app.app_type)?;
+    ctx.app.push_toast(
+        texts::tui_cloud_sync_backend_state_changed("S3 Compatible", enabled),
+        ToastKind::Success,
+    );
+    Ok(())
+}
+
+pub(super) fn s3_reset(ctx: &mut RuntimeActionContext<'_>) -> Result<(), AppError> {
+    set_s3_sync_settings(None)?;
+    *ctx.data = UiData::load(&ctx.app.app_type)?;
+    ctx.app
+        .push_toast(texts::tui_toast_s3_settings_cleared(), ToastKind::Success);
+    Ok(())
 }
 
 pub(super) fn webdav_upload(ctx: &mut RuntimeActionContext<'_>) -> Result<(), AppError> {
@@ -303,6 +379,88 @@ pub(super) fn open_openclaw_daily_memory_file(
     Ok(())
 }
 
+pub(super) fn open_hermes_memory(
+    ctx: &mut RuntimeActionContext<'_>,
+    kind: MemoryKind,
+) -> Result<(), AppError> {
+    let content = crate::hermes_config::read_memory(kind)?;
+    ctx.app.open_editor(
+        texts::tui_hermes_memory_editor_title(hermes_memory_kind_label(kind)),
+        crate::cli::tui::app::EditorKind::Plain,
+        content,
+        crate::cli::tui::app::EditorSubmit::HermesMemory { kind },
+    );
+    Ok(())
+}
+
+pub(super) fn set_hermes_memory_enabled(
+    ctx: &mut RuntimeActionContext<'_>,
+    kind: MemoryKind,
+    enabled: bool,
+) -> Result<(), AppError> {
+    crate::hermes_config::set_memory_enabled(kind, enabled)?;
+    ctx.app.push_toast(
+        texts::tui_hermes_memory_toggle_saved(hermes_memory_kind_label(kind), enabled),
+        ToastKind::Success,
+    );
+    *ctx.data = UiData::load(&ctx.app.app_type)?;
+    Ok(())
+}
+
+pub(super) fn open_hermes_memory_directory(
+    ctx: &mut RuntimeActionContext<'_>,
+) -> Result<(), AppError> {
+    let target_dir = crate::hermes_config::get_hermes_dir().join("memories");
+    std::fs::create_dir_all(&target_dir).map_err(|error| AppError::io(&target_dir, error))?;
+    if let Err(err) = open_directory(&target_dir) {
+        ctx.app.push_toast(
+            texts::tui_hermes_memory_directory_open_failed(&err),
+            ToastKind::Error,
+        );
+    }
+    *ctx.data = UiData::load(&ctx.app.app_type)?;
+    Ok(())
+}
+
+pub(crate) fn hermes_memory_kind_label(kind: MemoryKind) -> &'static str {
+    match kind {
+        MemoryKind::Memory => texts::tui_hermes_memory_agent_tab(),
+        MemoryKind::User => texts::tui_hermes_memory_user_tab(),
+    }
+}
+
+fn open_directory(path: &Path) -> Result<bool, String> {
+    if std::env::var_os("CC_SWITCH_TEST_DISABLE_OPEN").is_some() {
+        return Ok(true);
+    }
+
+    #[cfg(target_os = "macos")]
+    let mut command = Command::new("open");
+
+    #[cfg(target_os = "linux")]
+    let mut command = Command::new("xdg-open");
+
+    #[cfg(target_os = "windows")]
+    let mut command = Command::new("explorer");
+
+    #[cfg(target_os = "android")]
+    let mut command = Command::new("termux-open");
+
+    let status = command
+        .arg(path)
+        .status()
+        .map_err(|error| format!("Failed to open directory {}: {error}", path.display()))?;
+
+    if status.success() {
+        Ok(true)
+    } else {
+        Err(format!(
+            "Failed to open directory {}: opener exited with status {status}",
+            path.display()
+        ))
+    }
+}
+
 pub(super) fn search_openclaw_daily_memory(
     ctx: &mut RuntimeActionContext<'_>,
     query: String,
@@ -391,6 +549,33 @@ fn queue_webdav_request(
         ctx.app.overlay = Overlay::None;
         ctx.app.push_toast(
             texts::tui_toast_webdav_request_failed(&err.to_string()),
+            ToastKind::Error,
+        );
+    }
+    Ok(())
+}
+
+fn queue_s3_request(
+    ctx: &mut RuntimeActionContext<'_>,
+    kind: WebDavReqKind,
+    title: String,
+) -> Result<(), AppError> {
+    let Some(tx) = ctx.webdav_req_tx else {
+        ctx.app
+            .push_toast(texts::tui_toast_s3_worker_disabled(), ToastKind::Warning);
+        return Ok(());
+    };
+    let request_id = ctx.webdav_loading.start();
+    ctx.app.overlay = Overlay::Loading {
+        kind: LoadingKind::S3,
+        title,
+        message: texts::tui_s3_loading_message().to_string(),
+    };
+    if let Err(error) = tx.send(WebDavReq { request_id, kind }) {
+        ctx.webdav_loading.cancel();
+        ctx.app.overlay = Overlay::None;
+        ctx.app.push_toast(
+            texts::tui_toast_s3_request_failed(&error.to_string()),
             ToastKind::Error,
         );
     }

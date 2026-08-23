@@ -11,7 +11,7 @@ use super::{
     provider_router::ProviderRouter,
     server::ProxyServerState,
     session::extract_session_id,
-    types::{AppProxyConfig, OptimizerConfig, RectifierConfig},
+    types::{AppProxyConfig, CopilotOptimizerConfig, OptimizerConfig, RectifierConfig},
 };
 
 pub struct HandlerContext {
@@ -23,8 +23,10 @@ pub struct HandlerContext {
     pub app_proxy: AppProxyConfig,
     pub rectifier_config: RectifierConfig,
     pub optimizer_config: OptimizerConfig,
+    pub copilot_optimizer_config: CopilotOptimizerConfig,
     pub request_model: String,
     pub session_id: String,
+    pub session_client_provided: bool,
     pub current_provider_id_at_start: String,
 }
 
@@ -59,12 +61,13 @@ impl HandlerContext {
             })?;
         let rectifier_config = state.db.get_rectifier_config().unwrap_or_default();
         let optimizer_config = state.db.get_optimizer_config().unwrap_or_default();
+        let copilot_optimizer_config = state.db.get_copilot_optimizer_config().unwrap_or_default();
         let request_model = body
             .get("model")
             .and_then(|value| value.as_str())
             .unwrap_or("unknown")
             .to_string();
-        let session_id = extract_session_id(headers, body, app_type.as_str());
+        let session_result = extract_session_id(headers, body, app_type.as_str());
 
         Ok(Self {
             start_time,
@@ -75,8 +78,10 @@ impl HandlerContext {
             app_proxy,
             rectifier_config,
             optimizer_config,
+            copilot_optimizer_config,
             request_model,
-            session_id,
+            session_id: session_result.session_id,
+            session_client_provided: session_result.client_provided,
             current_provider_id_at_start,
         })
     }
@@ -132,6 +137,7 @@ mod tests {
     use tempfile::TempDir;
     use tokio::sync::RwLock;
 
+    use crate::proxy::providers::gemini_shadow::GeminiShadowStore;
     use crate::{database::Database, proxy::types::ProxyConfig};
 
     struct TempHome {
@@ -209,6 +215,8 @@ mod tests {
             start_time: Arc::new(RwLock::new(None)),
             current_providers: Arc::new(RwLock::new(Default::default())),
             provider_router: Arc::new(ProviderRouter::new(db)),
+            codex_chat_history: Arc::new(Default::default()),
+            gemini_shadow: Arc::new(GeminiShadowStore::default()),
         }
     }
 
@@ -230,6 +238,7 @@ mod tests {
             .get_proxy_config_for_app("claude")
             .await
             .expect("read app proxy config");
+        config.enabled = true;
         config.auto_failover_enabled = true;
         db.update_proxy_config_for_app(config)
             .await
@@ -269,6 +278,7 @@ mod tests {
             .get_proxy_config_for_app("claude")
             .await
             .expect("read app proxy config");
+        config.enabled = true;
         config.auto_failover_enabled = true;
         db.update_proxy_config_for_app(config)
             .await
@@ -305,6 +315,7 @@ mod tests {
             .get_proxy_config_for_app("claude")
             .await
             .expect("read app proxy config");
+        config.enabled = true;
         config.auto_failover_enabled = true;
         db.update_proxy_config_for_app(config)
             .await

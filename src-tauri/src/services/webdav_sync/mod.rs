@@ -4,61 +4,36 @@
 //! Current layout uses `{root}/v2/db-v6/{profile}/`, with legacy fallback to
 //! `{root}/v2/{profile}/`. Artifact set: `db.sql` + `skills.zip`.
 
-mod archive;
+pub(crate) mod archive;
 
 use std::collections::BTreeMap;
 
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use tempfile::tempdir;
+use serde::Deserialize;
 
-use crate::database::Database;
 use crate::error::AppError;
 use crate::services::webdav;
 use crate::settings::{
     get_webdav_sync_settings, update_webdav_sync_status, WebDavSyncSettings, WebDavSyncStatus,
 };
 
-use self::archive::{restore_skills_zip, zip_skills_ssot, SkillsBackup};
+use super::sync_protocol::{
+    apply_snapshot_with_restore_guard, build_local_snapshot, localized, run_with_sync_lock,
+    sha256_hex, validate_artifact_size_limit, validate_manifest_compat, verify_artifact,
+    ArtifactMeta, RemoteLayout, SyncManifest, DB_COMPAT_VERSION, MAX_MANIFEST_BYTES,
+    MAX_SYNC_ARTIFACT_BYTES, PROTOCOL_FORMAT, PROTOCOL_VERSION, REMOTE_DB_SQL, REMOTE_MANIFEST,
+    REMOTE_SKILLS_ZIP,
+};
 
-// ---------------------------------------------------------------------------
-// i18n 辅助
-// ---------------------------------------------------------------------------
+#[cfg(test)]
+use super::sync_protocol::{
+    apply_snapshot, compute_snapshot_id, detect_system_device_name, effective_db_compat_version,
+    extract_sql_user_version, normalize_device_name, validate_sql_user_version_for_import,
+    LEGACY_DB_COMPAT_VERSION, MAX_DEVICE_NAME_LEN,
+};
 
-fn localized(key: &'static str, zh: impl Into<String>, en: impl Into<String>) -> AppError {
-    AppError::localized(key, zh, en)
-}
-
-fn io_context_localized(
-    _key: &'static str,
-    zh: impl Into<String>,
-    en: impl Into<String>,
-    source: std::io::Error,
-) -> AppError {
-    let zh_msg = zh.into();
-    let en_msg = en.into();
-    AppError::IoContext {
-        context: format!("{zh_msg} ({en_msg})"),
-        source,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 常量
-// ---------------------------------------------------------------------------
-
-const PROTOCOL_FORMAT: &str = "cc-switch-webdav-sync";
-const PROTOCOL_VERSION: u32 = 2;
-const DB_COMPAT_VERSION: u32 = 6;
-const LEGACY_DB_COMPAT_VERSION: u32 = 5;
-const REMOTE_DB_SQL: &str = "db.sql";
-const REMOTE_SKILLS_ZIP: &str = "skills.zip";
-const REMOTE_MANIFEST: &str = "manifest.json";
-
-const MAX_DEVICE_NAME_LEN: usize = 64;
-const MAX_MANIFEST_BYTES: u64 = 1024 * 1024; // 1 MB
-const MAX_SYNC_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024; // 512 MB
+#[cfg(test)]
+use crate::database::{Database, SCHEMA_VERSION};
 
 // ---------------------------------------------------------------------------
 // 公共类型
@@ -78,51 +53,16 @@ pub struct WebDavSyncSummary {
     pub message: String,
 }
 
-// ---------------------------------------------------------------------------
-// Manifest 类型
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SyncManifest {
-    format: String,
-    version: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    db_compat_version: Option<u32>,
-    device_name: String,
-    created_at: String,
-    artifacts: BTreeMap<String, ArtifactMeta>,
-    snapshot_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ArtifactMeta {
-    sha256: String,
-    size: u64,
-}
-
-// ---------------------------------------------------------------------------
-// 本地快照
-// ---------------------------------------------------------------------------
-
-struct LocalSnapshot {
-    db_sql: Vec<u8>,
-    skills_zip: Vec<u8>,
-    manifest_bytes: Vec<u8>,
-    manifest_hash: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RemoteLayout {
-    Current,
-    Legacy,
-}
-
 struct RemoteSnapshot {
     layout: RemoteLayout,
     manifest: SyncManifest,
     manifest_bytes: Vec<u8>,
     manifest_etag: Option<String>,
+}
+
+#[cfg(test)]
+pub(crate) fn sync_mutex() -> &'static tokio::sync::Mutex<()> {
+    super::sync_protocol::sync_mutex()
 }
 
 // ---------------------------------------------------------------------------
@@ -137,16 +77,16 @@ impl WebDavSyncService {
     }
 
     pub fn upload() -> Result<WebDavSyncSummary, AppError> {
-        run_http(upload())
+        run_http(run_with_sync_lock(upload()))
     }
 
     pub fn download() -> Result<WebDavSyncSummary, AppError> {
-        run_http(download())
+        run_http(run_with_sync_lock(download()))
     }
 
     /// 用户确认后调用：下载 V1 数据 → 应用 → 上传 V2 → 删除 V1
     pub fn migrate_v1_to_v2() -> Result<WebDavSyncSummary, AppError> {
-        run_http(migrate_v1_to_v2())
+        run_http(run_with_sync_lock(migrate_v1_to_v2()))
     }
 }
 
@@ -155,23 +95,24 @@ impl WebDavSyncService {
 // ---------------------------------------------------------------------------
 
 async fn check_connection() -> Result<(), AppError> {
-    let settings = load_webdav_settings()?;
+    // Connectivity checks are also used immediately after saving a disabled
+    // backend. Saving credentials must not implicitly enable WebDAV.
+    let settings = load_webdav_settings(false)?;
     let auth = webdav::auth_from_credentials(&settings.username, &settings.password);
     webdav::test_connection(&settings.base_url, &auth).await?;
     let dir_segments = remote_dir_segments(&settings, RemoteLayout::Current);
     webdav::ensure_remote_directories(&settings.base_url, &dir_segments, &auth).await?;
-    webdav::verify_round_trip_readability(&settings.base_url, &dir_segments, &auth).await?;
     Ok(())
 }
 
 async fn upload() -> Result<WebDavSyncSummary, AppError> {
-    let mut settings = load_webdav_settings()?;
+    let mut settings = load_webdav_settings(true)?;
     let auth = webdav::auth_from_credentials(&settings.username, &settings.password);
 
     let dir_segments = remote_dir_segments(&settings, RemoteLayout::Current);
     webdav::ensure_remote_directories(&settings.base_url, &dir_segments, &auth).await?;
 
-    let snapshot = build_local_snapshot(&settings)?;
+    let snapshot = build_local_snapshot()?;
 
     // 上传 artifacts
     let db_url = build_artifact_url(&settings, RemoteLayout::Current, REMOTE_DB_SQL)?;
@@ -185,17 +126,8 @@ async fn upload() -> Result<WebDavSyncSummary, AppError> {
     webdav::put_bytes(
         &manifest_url,
         &auth,
-        snapshot.manifest_bytes.clone(),
+        snapshot.manifest_bytes,
         "application/json",
-    )
-    .await?;
-
-    webdav::verify_readback_matches(
-        &settings.base_url,
-        &manifest_url,
-        &auth,
-        &snapshot.manifest_bytes,
-        "manifest",
     )
     .await?;
 
@@ -210,9 +142,6 @@ async fn upload() -> Result<WebDavSyncSummary, AppError> {
 
     persist_sync_success_best_effort(&mut settings, &snapshot.manifest_hash, etag);
 
-    // 上传成功后，静默清理 V1 远端数据
-    cleanup_v1_remote(&settings, &auth).await;
-
     Ok(WebDavSyncSummary {
         decision: SyncDecision::Upload,
         message: "WebDAV upload completed".to_string(),
@@ -220,7 +149,7 @@ async fn upload() -> Result<WebDavSyncSummary, AppError> {
 }
 
 async fn download() -> Result<WebDavSyncSummary, AppError> {
-    let mut settings = load_webdav_settings()?;
+    let mut settings = load_webdav_settings(true)?;
     let auth = webdav::auth_from_credentials(&settings.username, &settings.password);
 
     if let Some(snapshot) = find_remote_snapshot(&settings, &auth).await? {
@@ -244,13 +173,7 @@ async fn download() -> Result<WebDavSyncSummary, AppError> {
         )
         .await?;
 
-        {
-            let _guard = crate::services::state_coordination::acquire_restore_mutation_guard()
-                .await
-                .map_err(AppError::Message)?;
-            ensure_restore_allowed().await?;
-            apply_snapshot(&db_sql, &skills_zip)?;
-        }
+        apply_snapshot_with_restore_guard(&db_sql, &skills_zip).await?;
         persist_sync_success_best_effort(&mut settings, &manifest_hash, snapshot.manifest_etag);
         cleanup_v1_remote(&settings, &auth).await;
 
@@ -276,7 +199,7 @@ async fn download() -> Result<WebDavSyncSummary, AppError> {
 // 设置加载 / 验证
 // ---------------------------------------------------------------------------
 
-fn load_webdav_settings() -> Result<WebDavSyncSettings, AppError> {
+fn load_webdav_settings(require_enabled: bool) -> Result<WebDavSyncSettings, AppError> {
     let settings = get_webdav_sync_settings().ok_or_else(|| {
         localized(
             "webdav.sync.not_configured",
@@ -284,7 +207,7 @@ fn load_webdav_settings() -> Result<WebDavSyncSettings, AppError> {
             "WebDAV sync is not configured",
         )
     })?;
-    if !settings.enabled {
+    if require_enabled && !settings.enabled {
         return Err(localized(
             "webdav.sync.not_enabled",
             "WebDAV 同步未启用",
@@ -320,145 +243,6 @@ fn build_artifact_url(
     webdav::build_remote_url(&settings.base_url, &segments)
 }
 
-// ---------------------------------------------------------------------------
-// 本地快照构建
-// ---------------------------------------------------------------------------
-
-fn build_local_snapshot(_settings: &WebDavSyncSettings) -> Result<LocalSnapshot, AppError> {
-    let tmp = tempdir().map_err(|e| {
-        io_context_localized(
-            "webdav.sync.snapshot_tmpdir_failed",
-            "创建 WebDAV 快照临时目录失败",
-            "Failed to create temporary directory for WebDAV snapshot",
-            e,
-        )
-    })?;
-
-    // 导出 DB
-    let db_sql = Database::init()?.export_sql_string_for_sync()?.into_bytes();
-
-    // 打包 skills
-    let skills_zip_path = tmp.path().join(REMOTE_SKILLS_ZIP);
-    zip_skills_ssot(&skills_zip_path)?;
-    let skills_zip =
-        std::fs::read(&skills_zip_path).map_err(|e| AppError::io(&skills_zip_path, e))?;
-
-    // 构建 artifacts map
-    let mut artifacts = BTreeMap::new();
-    artifacts.insert(
-        REMOTE_DB_SQL.to_string(),
-        ArtifactMeta {
-            sha256: sha256_hex(&db_sql),
-            size: db_sql.len() as u64,
-        },
-    );
-    artifacts.insert(
-        REMOTE_SKILLS_ZIP.to_string(),
-        ArtifactMeta {
-            sha256: sha256_hex(&skills_zip),
-            size: skills_zip.len() as u64,
-        },
-    );
-
-    let snapshot_id = compute_snapshot_id(&artifacts);
-    let device_name = detect_system_device_name().unwrap_or_else(|| "Unknown Device".to_string());
-
-    let manifest = SyncManifest {
-        format: PROTOCOL_FORMAT.to_string(),
-        version: PROTOCOL_VERSION,
-        db_compat_version: Some(DB_COMPAT_VERSION),
-        device_name,
-        created_at: Utc::now().to_rfc3339(),
-        artifacts,
-        snapshot_id,
-    };
-
-    let manifest_bytes =
-        serde_json::to_vec_pretty(&manifest).map_err(|e| AppError::JsonSerialize { source: e })?;
-    let manifest_hash = sha256_hex(&manifest_bytes);
-
-    Ok(LocalSnapshot {
-        db_sql,
-        skills_zip,
-        manifest_bytes,
-        manifest_hash,
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Manifest 验证
-// ---------------------------------------------------------------------------
-
-fn effective_db_compat_version(manifest: &SyncManifest, layout: RemoteLayout) -> Option<u32> {
-    manifest
-        .db_compat_version
-        .or_else(|| (layout == RemoteLayout::Legacy).then_some(LEGACY_DB_COMPAT_VERSION))
-}
-
-fn validate_manifest_compat(manifest: &SyncManifest, layout: RemoteLayout) -> Result<(), AppError> {
-    if manifest.format != PROTOCOL_FORMAT {
-        return Err(localized(
-            "webdav.sync.manifest_format_incompatible",
-            format!("远端 manifest 格式不兼容: {}", manifest.format),
-            format!(
-                "Remote manifest format is incompatible: {}",
-                manifest.format
-            ),
-        ));
-    }
-    if manifest.version != PROTOCOL_VERSION {
-        return Err(localized(
-            "webdav.sync.manifest_version_incompatible",
-            format!(
-                "远端 manifest 协议版本不兼容: v{} (本地 v{PROTOCOL_VERSION})",
-                manifest.version
-            ),
-            format!(
-                "Remote manifest protocol version is incompatible: v{} (local v{PROTOCOL_VERSION})",
-                manifest.version
-            ),
-        ));
-    }
-    let Some(db_compat_version) = effective_db_compat_version(manifest, layout) else {
-        return Err(localized(
-            "webdav.sync.manifest_db_version_missing",
-            "远端 manifest 缺少数据库兼容版本",
-            "Remote manifest is missing the database compatibility version.",
-        ));
-    };
-
-    match layout {
-        RemoteLayout::Current if db_compat_version != DB_COMPAT_VERSION => {
-            return Err(localized(
-                "webdav.sync.manifest_db_version_incompatible",
-                format!(
-                    "远端数据库快照版本不兼容: db-v{} (本地 db-v{DB_COMPAT_VERSION})",
-                    db_compat_version
-                ),
-                format!(
-                    "Remote database snapshot version is incompatible: db-v{} (local db-v{DB_COMPAT_VERSION})",
-                    db_compat_version
-                ),
-            ));
-        }
-        RemoteLayout::Legacy if db_compat_version > DB_COMPAT_VERSION => {
-            return Err(localized(
-                "webdav.sync.manifest_db_version_incompatible",
-                format!(
-                    "远端数据库快照版本不兼容: db-v{} (本地最高支持 db-v{DB_COMPAT_VERSION})",
-                    db_compat_version
-                ),
-                format!(
-                    "Remote database snapshot version is incompatible: db-v{} (local supports up to db-v{DB_COMPAT_VERSION})",
-                    db_compat_version
-                ),
-            ));
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
 async fn find_remote_snapshot(
     settings: &WebDavSyncSettings,
     auth: &webdav::WebDavAuth,
@@ -477,7 +261,7 @@ async fn fetch_remote_snapshot(
 ) -> Result<Option<RemoteSnapshot>, AppError> {
     let manifest_url = build_artifact_url(settings, layout, REMOTE_MANIFEST)?;
     let Some((manifest_bytes, manifest_etag)) =
-        webdav::get_bytes(&manifest_url, auth, Some(MAX_MANIFEST_BYTES)).await?
+        webdav::get_bytes(&manifest_url, auth, Some(MAX_MANIFEST_BYTES as u64)).await?
     else {
         return Ok(None);
     };
@@ -528,87 +312,8 @@ async fn download_and_verify(
             )
         })?;
 
-    // 先检查大小（快速），再检查 hash（昂贵）
-    if bytes.len() as u64 != meta.size {
-        return Err(localized(
-            "webdav.sync.artifact_size_mismatch",
-            format!(
-                "artifact {artifact_name} 大小不匹配 (expected: {}, got: {})",
-                meta.size,
-                bytes.len(),
-            ),
-            format!(
-                "Artifact {artifact_name} size mismatch (expected: {}, got: {})",
-                meta.size,
-                bytes.len(),
-            ),
-        ));
-    }
-
-    let actual_hash = sha256_hex(&bytes);
-    if actual_hash != meta.sha256 {
-        return Err(localized(
-            "webdav.sync.artifact_hash_mismatch",
-            format!(
-                "artifact {artifact_name} SHA256 校验失败 (expected: {}..., got: {}...)",
-                meta.sha256.get(..8).unwrap_or(&meta.sha256),
-                actual_hash.get(..8).unwrap_or(&actual_hash),
-            ),
-            format!(
-                "Artifact {artifact_name} SHA256 verification failed (expected: {}..., got: {}...)",
-                meta.sha256.get(..8).unwrap_or(&meta.sha256),
-                actual_hash.get(..8).unwrap_or(&actual_hash),
-            ),
-        ));
-    }
-
+    verify_artifact(&bytes, artifact_name, meta)?;
     Ok(bytes)
-}
-
-fn validate_artifact_size_limit(name: &str, size: u64) -> Result<(), AppError> {
-    if size > MAX_SYNC_ARTIFACT_BYTES {
-        let max_mb = MAX_SYNC_ARTIFACT_BYTES / 1024 / 1024;
-        return Err(localized(
-            "webdav.sync.artifact_too_large",
-            format!("artifact {name} 超过下载上限（{max_mb} MB）"),
-            format!("Artifact {name} exceeds download limit ({max_mb} MB)"),
-        ));
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// 快照应用（带 skills 备份回滚）
-// ---------------------------------------------------------------------------
-
-fn apply_snapshot(db_sql: &[u8], skills_zip: &[u8]) -> Result<(), AppError> {
-    let sql_str = std::str::from_utf8(db_sql).map_err(|e| {
-        localized(
-            "webdav.sync.sql_not_utf8",
-            format!("SQL 非 UTF-8: {e}"),
-            format!("SQL is not valid UTF-8: {e}"),
-        )
-    })?;
-
-    let skills_backup = SkillsBackup::backup_current_skills()?;
-
-    // 先替换 skills，再导入数据库；若导入失败则回滚 skills，避免"半恢复"。
-    restore_skills_zip(skills_zip)?;
-
-    if let Err(db_err) = Database::init()?.import_sql_string_for_sync(sql_str) {
-        if let Err(rollback_err) = skills_backup.restore() {
-            return Err(localized(
-                "webdav.sync.db_import_and_rollback_failed",
-                format!("导入数据库失败: {db_err}; 同时回滚 Skills 失败: {rollback_err}"),
-                format!(
-                    "Database import failed: {db_err}; skills rollback also failed: {rollback_err}"
-                ),
-            ));
-        }
-        return Err(db_err);
-    }
-
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -645,80 +350,6 @@ fn persist_sync_success_best_effort(
             false
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// Snapshot ID 计算
-// ---------------------------------------------------------------------------
-
-fn compute_snapshot_id(artifacts: &BTreeMap<String, ArtifactMeta>) -> String {
-    let combined: String = artifacts
-        .iter()
-        .map(|(name, meta)| format!("{name}:{}", meta.sha256))
-        .collect::<Vec<_>>()
-        .join("|");
-    sha256_hex(combined.as_bytes())
-}
-
-// ---------------------------------------------------------------------------
-// 设备名检测
-// ---------------------------------------------------------------------------
-
-fn detect_system_device_name() -> Option<String> {
-    let env_name = ["CC_SWITCH_DEVICE_NAME", "COMPUTERNAME", "HOSTNAME"]
-        .iter()
-        .filter_map(|key| std::env::var(key).ok())
-        .find_map(|value| normalize_device_name(&value));
-
-    if env_name.is_some() {
-        return env_name;
-    }
-
-    let output = std::process::Command::new("hostname").output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let hostname = String::from_utf8(output.stdout).ok()?;
-    normalize_device_name(&hostname)
-}
-
-fn normalize_device_name(raw: &str) -> Option<String> {
-    let compact = raw
-        .chars()
-        .fold(String::with_capacity(raw.len()), |mut acc, ch| {
-            if ch.is_whitespace() {
-                acc.push(' ');
-            } else if !ch.is_control() {
-                acc.push(ch);
-            }
-            acc
-        });
-    let normalized = compact.split_whitespace().collect::<Vec<_>>().join(" ");
-    let trimmed = normalized.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    let limited = trimmed
-        .chars()
-        .take(MAX_DEVICE_NAME_LEN)
-        .collect::<String>();
-    if limited.is_empty() {
-        None
-    } else {
-        Some(limited)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 工具函数
-// ---------------------------------------------------------------------------
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    let hash = hasher.finalize();
-    format!("{hash:x}")
 }
 
 fn run_http<F, T>(future: F) -> Result<T, AppError>
@@ -798,7 +429,7 @@ async fn detect_v1_manifest(
     auth: &webdav::WebDavAuth,
 ) -> Result<Option<V1Manifest>, AppError> {
     let url = build_v1_artifact_url(settings, REMOTE_MANIFEST)?;
-    let result = webdav::get_bytes(&url, auth, Some(MAX_MANIFEST_BYTES)).await?;
+    let result = webdav::get_bytes(&url, auth, Some(MAX_MANIFEST_BYTES as u64)).await?;
     match result {
         None => Ok(None),
         Some((bytes, _)) => {
@@ -881,7 +512,7 @@ async fn cleanup_v1_remote(settings: &WebDavSyncSettings, auth: &webdav::WebDavA
 
 /// 迁移 V1 → V2：下载 V1 数据 → 本地应用 → 上传 V2 → 删除 V1
 async fn migrate_v1_to_v2() -> Result<WebDavSyncSummary, AppError> {
-    let settings = load_webdav_settings()?;
+    let settings = load_webdav_settings(true)?;
     let auth = webdav::auth_from_credentials(&settings.username, &settings.password);
 
     // 1. 下载 V1 manifest
@@ -910,12 +541,7 @@ async fn migrate_v1_to_v2() -> Result<WebDavSyncSummary, AppError> {
     .await?;
 
     // 3. 应用到本地
-    let _guard = crate::services::state_coordination::acquire_restore_mutation_guard()
-        .await
-        .map_err(AppError::Message)?;
-    ensure_restore_allowed().await?;
-    apply_snapshot(&db_sql, &skills_zip)?;
-    drop(_guard);
+    apply_snapshot_with_restore_guard(&db_sql, &skills_zip).await?;
 
     // 4. 重新上传为 V2 格式（upload 内部会 best-effort 清理 V1 远端数据）
     upload().await?;
@@ -924,41 +550,6 @@ async fn migrate_v1_to_v2() -> Result<WebDavSyncSummary, AppError> {
         decision: SyncDecision::Download,
         message: "V1 → V2 migration completed".to_string(),
     })
-}
-
-async fn ensure_restore_allowed() -> Result<(), AppError> {
-    let db = std::sync::Arc::new(Database::init()?);
-    let proxy_service = crate::services::ProxyService::new(db);
-    let status = proxy_service.get_status().await;
-    if status.running {
-        return Err(localized(
-            "webdav.sync.restore_proxy_running",
-            "本地代理正在运行，请先停止代理后再执行 WebDAV 恢复或迁移",
-            "The local proxy is running. Stop it before WebDAV restore or migration.",
-        ));
-    }
-
-    let takeover_active = proxy_service
-        .is_app_takeover_active(&crate::AppType::Claude)
-        .await
-        .map_err(AppError::Message)?
-        || proxy_service
-            .is_app_takeover_active(&crate::AppType::Codex)
-            .await
-            .map_err(AppError::Message)?
-        || proxy_service
-            .is_app_takeover_active(&crate::AppType::Gemini)
-            .await
-            .map_err(AppError::Message)?;
-    if takeover_active {
-        return Err(localized(
-            "webdav.sync.restore_takeover_active",
-            "当前仍有应用处于代理接管状态，请先关闭接管后再执行 WebDAV 恢复或迁移",
-            "An app takeover is still active. Disable takeover before WebDAV restore or migration.",
-        ));
-    }
-
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -980,6 +571,19 @@ mod tests {
             auto_sync: false,
             status: WebDavSyncStatus::default(),
         }
+    }
+
+    #[test]
+    fn disabled_settings_can_be_loaded_for_connection_checks_only() {
+        let temp = tempfile::tempdir().expect("create isolated home");
+        let _environment = crate::test_support::TestEnvGuard::isolated(temp.path());
+        let mut settings = sample_settings();
+        settings.enabled = false;
+        crate::settings::set_webdav_sync_settings(Some(settings))
+            .expect("save disabled WebDAV settings");
+
+        assert!(load_webdav_settings(false).is_ok());
+        assert!(load_webdav_settings(true).is_err());
     }
 
     #[test]
@@ -1156,6 +760,255 @@ mod tests {
     }
 
     #[test]
+    fn extract_sql_user_version_reads_pragma_and_comment() {
+        assert_eq!(
+            extract_sql_user_version("-- header\nPRAGMA user_version=10;\n"),
+            Some(10)
+        );
+        assert_eq!(
+            extract_sql_user_version("-- user_version: 11\nPRAGMA foreign_keys=OFF;\n"),
+            Some(11)
+        );
+    }
+
+    #[test]
+    fn validate_sql_user_version_rejects_future_schema_before_restore() {
+        let sql = format!(
+            "-- CC Switch SQLite 导出\nPRAGMA user_version={};\n",
+            SCHEMA_VERSION + 1
+        );
+        let err = validate_sql_user_version_for_import(&sql)
+            .expect_err("future schema should be rejected before applying snapshot");
+        assert!(
+            err.to_string().contains("版本过新") || err.to_string().contains("schema is too new"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn apply_snapshot_accepts_current_schema_v13_sync_export() -> Result<(), AppError> {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let _env = crate::test_support::TestEnvGuard::isolated(temp.path());
+
+        let remote_db = Database::memory().expect("create remote db");
+        {
+            let conn = crate::database::lock_conn!(remote_db.conn);
+            Database::set_user_version(&conn, SCHEMA_VERSION)
+                .expect("mark remote snapshot as current schema");
+            conn.execute(
+                "INSERT INTO providers (id, app_type, name, settings_config, meta)
+                 VALUES ('remote-provider', 'claude', 'Remote Provider', '{}', '{}')",
+                [],
+            )
+            .expect("insert remote provider");
+        }
+        let db_sql = remote_db
+            .export_sql_string_for_sync()
+            .expect("export v13 sync sql");
+
+        let zip_path = temp.path().join("remote-skills.zip");
+        {
+            let file = std::fs::File::create(&zip_path).expect("create remote skills zip");
+            let mut writer = zip::ZipWriter::new(file);
+            writer
+                .start_file(
+                    "remote-skill/SKILL.md",
+                    crate::services::webdav_sync::archive::zip_file_options(),
+                )
+                .expect("start remote skill");
+            use std::io::Write;
+            writer.write_all(b"remote").expect("write remote skill");
+            writer.finish().expect("finish remote skills zip");
+        }
+        let skills_zip = std::fs::read(&zip_path).expect("read remote skills zip");
+
+        apply_snapshot(db_sql.as_bytes(), &skills_zip).expect("apply current-schema snapshot");
+
+        let local_db = Database::init().expect("open local db");
+        let conn = crate::database::lock_conn!(local_db.conn);
+        let provider_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM providers WHERE id = 'remote-provider'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count imported provider");
+        assert_eq!(provider_count, 1);
+        assert!(
+            crate::services::skill::SkillService::get_ssot_dir()
+                .expect("ssot dir")
+                .join("remote-skill")
+                .join("SKILL.md")
+                .exists(),
+            "current-schema restore should unpack remote skills"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn apply_snapshot_rejects_future_schema_without_touching_existing_skills() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let _env = crate::test_support::TestEnvGuard::isolated(temp.path());
+
+        let existing_skill = crate::services::skill::SkillService::get_ssot_dir()
+            .expect("ssot dir")
+            .join("existing")
+            .join("SKILL.md");
+        std::fs::create_dir_all(existing_skill.parent().expect("skill parent"))
+            .expect("create existing skill parent");
+        std::fs::write(&existing_skill, "existing").expect("write existing skill");
+
+        let zip_path = temp.path().join("replacement-skills.zip");
+        {
+            let file = std::fs::File::create(&zip_path).expect("create replacement zip");
+            let mut writer = zip::ZipWriter::new(file);
+            writer
+                .start_file(
+                    "replacement/SKILL.md",
+                    crate::services::webdav_sync::archive::zip_file_options(),
+                )
+                .expect("start replacement skill");
+            use std::io::Write;
+            writer
+                .write_all(b"replacement")
+                .expect("write replacement skill");
+            writer.finish().expect("finish replacement zip");
+        }
+        let skills_zip = std::fs::read(&zip_path).expect("read replacement zip");
+        let sql = format!(
+            "-- CC Switch SQLite 导出\nPRAGMA user_version={};\n",
+            SCHEMA_VERSION + 1
+        );
+
+        apply_snapshot(sql.as_bytes(), &skills_zip)
+            .expect_err("future schema should be rejected before restoring skills");
+
+        assert_eq!(
+            std::fs::read_to_string(&existing_skill).expect("read existing skill"),
+            "existing",
+            "future schema restore must leave existing skills untouched"
+        );
+        assert!(
+            !crate::services::skill::SkillService::get_ssot_dir()
+                .expect("ssot dir")
+                .join("replacement")
+                .exists(),
+            "future schema restore must not unpack replacement skills"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_snapshot_rolls_back_skills_when_database_init_fails() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let _env = crate::test_support::TestEnvGuard::isolated(temp.path());
+
+        let ssot = crate::services::skill::SkillService::get_ssot_dir().expect("ssot dir");
+        let existing_skill = ssot.join("existing").join("SKILL.md");
+        std::fs::create_dir_all(existing_skill.parent().expect("skill parent"))
+            .expect("create existing skill parent");
+        std::fs::write(&existing_skill, "existing").expect("write existing skill");
+
+        let zip_path = temp.path().join("replacement-skills.zip");
+        {
+            let file = std::fs::File::create(&zip_path).expect("create replacement zip");
+            let mut writer = zip::ZipWriter::new(file);
+            writer
+                .start_file(
+                    "replacement/SKILL.md",
+                    crate::services::webdav_sync::archive::zip_file_options(),
+                )
+                .expect("start replacement skill");
+            use std::io::Write;
+            writer
+                .write_all(b"replacement")
+                .expect("write replacement skill");
+            writer.finish().expect("finish replacement zip");
+        }
+        let skills_zip = std::fs::read(&zip_path).expect("read replacement zip");
+
+        let db_target = temp.path().join("external.db");
+        std::fs::write(&db_target, b"not sqlite").expect("write external db");
+        let db_link = temp.path().join(".cc-switch").join("cc-switch.db");
+        symlink(&db_target, &db_link).expect("create db symlink");
+
+        apply_snapshot(
+            b"-- CC Switch SQLite export\nPRAGMA user_version=0;\n",
+            &skills_zip,
+        )
+        .expect_err("db init failure should fail the restore");
+
+        assert_eq!(
+            std::fs::read_to_string(&existing_skill).expect("read existing skill"),
+            "existing",
+            "DB init failure must roll back restored skills"
+        );
+        assert!(
+            !ssot.join("replacement").exists(),
+            "DB init failure must remove replacement skills"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_snapshot_rejects_symlink_parent_config_dir_before_restoring_skills() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let _env = crate::test_support::TestEnvGuard::isolated(temp.path());
+        let real_parent = temp.path().join("real-parent");
+        let external_parent = temp.path().join("external-parent");
+        std::fs::create_dir(&real_parent).expect("create real parent");
+        std::fs::create_dir(&external_parent).expect("create external parent");
+        symlink(&external_parent, real_parent.join("link")).expect("create symlink parent");
+        unsafe {
+            std::env::set_var(
+                "CC_SWITCH_CONFIG_DIR",
+                real_parent.join("link").join("..").join("cc-switch"),
+            );
+        }
+
+        let zip_path = temp.path().join("replacement-skills.zip");
+        {
+            let file = std::fs::File::create(&zip_path).expect("create replacement zip");
+            let mut writer = zip::ZipWriter::new(file);
+            writer
+                .start_file(
+                    "replacement/SKILL.md",
+                    crate::services::webdav_sync::archive::zip_file_options(),
+                )
+                .expect("start replacement skill");
+            use std::io::Write;
+            writer
+                .write_all(b"replacement")
+                .expect("write replacement skill");
+            writer.finish().expect("finish replacement zip");
+        }
+        let skills_zip = std::fs::read(&zip_path).expect("read replacement zip");
+
+        let err = apply_snapshot(
+            b"-- CC Switch SQLite export\nPRAGMA user_version=0;\n",
+            &skills_zip,
+        )
+        .expect_err("symlink parent config dir should fail before restoring skills");
+
+        assert!(
+            err.to_string().contains("符号链接") || err.to_string().contains("symlink"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !real_parent.join("cc-switch/skills").exists(),
+            "restore must not create the normalized skills directory"
+        );
+        assert!(
+            !external_parent.join("cc-switch/skills").exists(),
+            "restore must not follow the symlinked parent into external storage"
+        );
+    }
+
+    #[test]
     fn normalize_device_name_trims() {
         assert_eq!(
             normalize_device_name("  my-host  "),
@@ -1193,10 +1046,11 @@ mod tests {
     }
 
     #[test]
-    fn detect_system_device_name_returns_some() {
-        // 在 CI/本地环境中应该总能获取到设备名
+    fn detect_system_device_name_returns_env_name() {
+        std::env::set_var("CC_SWITCH_DEVICE_NAME", "test-device");
         let name = detect_system_device_name();
-        assert!(name.is_some(), "should detect a device name");
+        std::env::remove_var("CC_SWITCH_DEVICE_NAME");
+        assert_eq!(name.as_deref(), Some("test-device"));
     }
 
     #[test]

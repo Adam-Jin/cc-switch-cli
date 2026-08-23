@@ -1,10 +1,13 @@
 use clap::Subcommand;
 use std::future::Future;
 
-use crate::app_config::AppType;
+use crate::app_config::{AppType, SkillApps};
+use crate::cli::commands::app_targets::{
+    app_target_names, app_targets_or_default, parse_app_targets, supported_app_target_labels,
+};
 use crate::cli::ui::{create_table, highlight, info, success};
 use crate::error::AppError;
-use crate::services::skill::{SkillRepo, SyncMethod};
+use crate::services::skill::{ImportSkillSelection, SkillRepo, SyncMethod};
 use crate::services::SkillService;
 
 #[derive(Subcommand)]
@@ -17,10 +20,37 @@ pub enum SkillsCommand {
         /// Optional query filter (matches name/directory)
         query: Option<String>,
     },
+    /// Search the public skills.sh marketplace
+    #[command(alias = "marketplace")]
+    Market {
+        /// Search query
+        query: String,
+        /// Maximum number of results to show
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Result offset for pagination
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+    },
     /// Install a skill (SSOT -> app skills dir)
     Install {
         /// Skill directory name or full key (owner/name:directory)
         spec: String,
+    },
+    /// Manually check installed repository-backed skills for updates
+    CheckUpdates,
+    /// Manually update one repository-backed skill or every detected update
+    Update {
+        /// Installed skill directory or id
+        #[arg(
+            value_name = "SPEC",
+            required_unless_present = "all",
+            conflicts_with = "all"
+        )]
+        spec: Option<String>,
+        /// Update every skill reported by a fresh manual check
+        #[arg(long)]
+        all: bool,
     },
     /// Uninstall a skill (remove from SSOT and app dirs)
     Uninstall {
@@ -31,11 +61,31 @@ pub enum SkillsCommand {
     Enable {
         /// Skill directory or id
         spec: String,
+        /// Target apps. Accepts repeated values or comma-separated backend ids.
+        #[arg(long, value_name = "APP[,APP]", value_delimiter = ',', num_args = 1)]
+        apps: Vec<String>,
     },
     /// Disable a skill for the selected app
     Disable {
         /// Skill directory or id
         spec: String,
+        /// Target apps. Accepts repeated values or comma-separated backend ids.
+        #[arg(long, value_name = "APP[,APP]", value_delimiter = ',', num_args = 1)]
+        apps: Vec<String>,
+    },
+    /// Replace the app matrix for a skill
+    SetApps {
+        /// Skill directory or id
+        spec: String,
+        /// Complete enabled app list for this skill
+        #[arg(
+            long,
+            value_name = "APP[,APP]",
+            required = true,
+            value_delimiter = ',',
+            num_args = 1
+        )]
+        apps: Vec<String>,
     },
     /// Sync enabled skills to app skills dirs
     Sync,
@@ -43,6 +93,9 @@ pub enum SkillsCommand {
     ScanUnmanaged,
     /// Import unmanaged skills from app skills dirs into SSOT
     ImportFromApps {
+        /// Enabled apps for every imported skill. Defaults to the apps where each skill was found.
+        #[arg(long, value_name = "APP[,APP]", value_delimiter = ',', num_args = 1)]
+        apps: Vec<String>,
         /// One or more skill directories to import
         directories: Vec<String>,
     },
@@ -94,13 +147,21 @@ pub fn execute(cmd: SkillsCommand, app: Option<AppType>) -> Result<(), AppError>
     match cmd {
         SkillsCommand::List => list_installed(),
         SkillsCommand::Discover { query } => discover_skills(query.as_deref()),
+        SkillsCommand::Market {
+            query,
+            limit,
+            offset,
+        } => search_market(&query, limit, offset),
         SkillsCommand::Install { spec } => install_skill(&app_type, &spec),
+        SkillsCommand::CheckUpdates => check_skill_updates(),
+        SkillsCommand::Update { spec, all } => update_skills(spec.as_deref(), all),
         SkillsCommand::Uninstall { spec } => uninstall_skill(&spec),
-        SkillsCommand::Enable { spec } => toggle_skill(&app_type, &spec, true),
-        SkillsCommand::Disable { spec } => toggle_skill(&app_type, &spec, false),
+        SkillsCommand::Enable { spec, apps } => toggle_skill(&app_type, &spec, &apps, true),
+        SkillsCommand::Disable { spec, apps } => toggle_skill(&app_type, &spec, &apps, false),
+        SkillsCommand::SetApps { spec, apps } => set_skill_apps(&spec, &apps),
         SkillsCommand::Sync => sync_skills(app.as_ref()),
         SkillsCommand::ScanUnmanaged => scan_unmanaged(),
-        SkillsCommand::ImportFromApps { directories } => import_from_apps(directories),
+        SkillsCommand::ImportFromApps { apps, directories } => import_from_apps(apps, directories),
         SkillsCommand::Info { spec } => show_skill_info(&spec),
         SkillsCommand::SyncMethod { method } => sync_method(method),
         SkillsCommand::Repos(repos_cmd) => execute_repos(repos_cmd),
@@ -113,6 +174,47 @@ fn run_async<T>(fut: impl Future<Output = Result<T, AppError>>) -> Result<T, App
         .build()
         .map_err(|e| AppError::Message(format!("Failed to create runtime: {e}")))?
         .block_on(fut)
+}
+
+fn search_market(query: &str, limit: usize, offset: usize) -> Result<(), AppError> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Err(AppError::Message(
+            "Search query cannot be empty".to_string(),
+        ));
+    }
+
+    let service = SkillService::new()?;
+    let result = run_async(service.search_skills_sh(query, limit, offset))?;
+
+    if result.skills.is_empty() {
+        println!("{}", info("No skills found on skills.sh."));
+        return Ok(());
+    }
+
+    let mut table = create_table();
+    table.set_header(vec!["Key", "Directory", "Name", "Installs", "Repo"]);
+    for skill in result.skills {
+        table.add_row(vec![
+            skill.key,
+            skill.directory,
+            skill.name,
+            skill.installs.to_string(),
+            format!("{}/{}", skill.repo_owner, skill.repo_name),
+        ]);
+    }
+
+    println!("{}", table);
+    println!(
+        "{}",
+        info(&format!(
+            "Showing skills.sh results {}-{} of {}. Install with: cc-switch skills install <key>",
+            offset + 1,
+            offset + limit.min(result.total_count.saturating_sub(offset)),
+            result.total_count
+        ))
+    );
+    Ok(())
 }
 
 fn list_installed() -> Result<(), AppError> {
@@ -131,6 +233,7 @@ fn list_installed() -> Result<(), AppError> {
         "Codex",
         "Gemini",
         "OpenCode",
+        "Hermes",
     ]);
     for skill in skills {
         table.add_row(vec![
@@ -140,6 +243,7 @@ fn list_installed() -> Result<(), AppError> {
             if skill.apps.codex { "✓" } else { " " }.to_string(),
             if skill.apps.gemini { "✓" } else { " " }.to_string(),
             if skill.apps.opencode { "✓" } else { " " }.to_string(),
+            if skill.apps.hermes { "✓" } else { " " }.to_string(),
         ]);
     }
 
@@ -177,6 +281,7 @@ fn discover_skills(query: Option<&str>) -> Result<(), AppError> {
 }
 
 fn install_skill(app_type: &AppType, spec: &str) -> Result<(), AppError> {
+    ensure_supported_skills_app(app_type, "install")?;
     let service = SkillService::new()?;
     let installed = run_async(service.install(spec, app_type))?;
     println!(
@@ -190,29 +295,143 @@ fn install_skill(app_type: &AppType, spec: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+fn check_skill_updates() -> Result<(), AppError> {
+    let service = SkillService::new()?;
+    let result = run_async(service.check_updates())?;
+
+    if result.updates.is_empty() {
+        if result.failures.is_empty() {
+            println!("{}", info("All repository-backed skills are up to date."));
+        }
+    } else {
+        let mut table = create_table();
+        table.set_header(vec!["Directory", "Name"]);
+        for update in &result.updates {
+            table.add_row(vec![update.directory.clone(), update.name.clone()]);
+        }
+        println!("{table}");
+    }
+
+    if result.failures.is_empty() {
+        Ok(())
+    } else {
+        Err(AppError::Message(format!(
+            "Update check incomplete:\n{}",
+            result.failures.join("\n")
+        )))
+    }
+}
+
+fn update_skills(spec: Option<&str>, all: bool) -> Result<(), AppError> {
+    let service = SkillService::new()?;
+    let mut check_failures = Vec::new();
+    let ids = if all {
+        let check = run_async(service.check_updates())?;
+        check_failures = check.failures;
+        check
+            .updates
+            .into_iter()
+            .map(|update| update.id)
+            .collect::<Vec<_>>()
+    } else {
+        let spec =
+            spec.ok_or_else(|| AppError::InvalidInput("Provide a skill or use --all".to_string()))?;
+        let index = SkillService::load_index()?;
+        let skill = index
+            .skills
+            .values()
+            .find(|skill| {
+                skill.directory.eq_ignore_ascii_case(spec) || skill.id.eq_ignore_ascii_case(spec)
+            })
+            .ok_or_else(|| AppError::Message(format!("Skill not found: {spec}")))?;
+        vec![skill.id.clone()]
+    };
+
+    if ids.is_empty() {
+        if check_failures.is_empty() {
+            println!("{}", info("All repository-backed skills are up to date."));
+            return Ok(());
+        }
+        return Err(AppError::Message(format!(
+            "No updates were applied because the update check was incomplete:\n{}",
+            check_failures.join("\n")
+        )));
+    }
+
+    let batch = run_async(async { Ok(service.update_skills(&ids).await) })?;
+    if !batch.updated.is_empty() {
+        println!(
+            "{}",
+            success(&format!("✓ Updated {} skill(s)", batch.updated.len()))
+        );
+    }
+
+    let mut failures = check_failures;
+    failures.extend(
+        batch
+            .failures
+            .into_iter()
+            .map(|failure| format!("{}: {}", failure.id, failure.error)),
+    );
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(AppError::Message(format!(
+            "Some skill updates need attention:\n{}",
+            failures.join("\n")
+        )))
+    }
+}
+
 fn uninstall_skill(spec: &str) -> Result<(), AppError> {
     SkillService::uninstall(spec)?;
     println!("{}", success(&format!("✓ Uninstalled skill '{spec}'")));
     Ok(())
 }
 
-fn toggle_skill(app_type: &AppType, spec: &str, enabled: bool) -> Result<(), AppError> {
-    SkillService::toggle_app(spec, app_type, enabled)?;
+fn toggle_skill(
+    app_type: &AppType,
+    spec: &str,
+    raw_apps: &[String],
+    enabled: bool,
+) -> Result<(), AppError> {
+    let apps = app_targets_or_default(raw_apps, app_type.clone(), "Skills")?;
+    for app in &apps {
+        SkillService::toggle_app(spec, app, enabled)?;
+    }
     println!(
         "{}",
         success(&format!(
             "✓ {} '{}' for {}",
             if enabled { "Enabled" } else { "Disabled" },
             spec,
-            app_type.as_str()
+            app_target_names(&apps)
         ))
     );
     Ok(())
 }
 
 fn sync_skills(app: Option<&AppType>) -> Result<(), AppError> {
+    if let Some(app) = app {
+        ensure_supported_skills_app(app, "sync")?;
+    }
     SkillService::sync_all_enabled(app)?;
     println!("{}", success("✓ Skills synced successfully"));
+    Ok(())
+}
+
+fn set_skill_apps(spec: &str, raw_apps: &[String]) -> Result<(), AppError> {
+    let targets = parse_app_targets(raw_apps, "Skills")?;
+    let apps = skill_apps_from_targets(&targets);
+    SkillService::set_apps(spec, apps)?;
+    println!(
+        "{}",
+        success(&format!(
+            "✓ Set skill '{}' apps to {}",
+            spec,
+            app_target_names(&targets)
+        ))
+    );
     Ok(())
 }
 
@@ -232,18 +451,49 @@ fn scan_unmanaged() -> Result<(), AppError> {
     Ok(())
 }
 
-fn import_from_apps(directories: Vec<String>) -> Result<(), AppError> {
+fn import_from_apps(raw_apps: Vec<String>, directories: Vec<String>) -> Result<(), AppError> {
     if directories.is_empty() {
         return Err(AppError::InvalidInput(
             "Please provide at least one directory".to_string(),
         ));
     }
 
-    let imported = SkillService::import_from_apps(directories)?;
+    let imported = if raw_apps.is_empty() {
+        SkillService::import_from_app_dirs(directories)?
+    } else {
+        let targets = parse_app_targets(&raw_apps, "Skills")?;
+        let apps = skill_apps_from_targets(&targets);
+        let imports = directories
+            .into_iter()
+            .map(|directory| ImportSkillSelection {
+                directory,
+                apps: apps.clone(),
+            })
+            .collect();
+        SkillService::import_from_apps(imports)?
+    };
     println!(
         "{}",
         success(&format!("✓ Imported {} skill(s) into SSOT", imported.len()))
     );
+    Ok(())
+}
+
+fn skill_apps_from_targets(targets: &[AppType]) -> SkillApps {
+    let mut apps = SkillApps::default();
+    for app in targets {
+        apps.set_enabled_for(app, true);
+    }
+    apps
+}
+
+fn ensure_supported_skills_app(app: &AppType, action: &str) -> Result<(), AppError> {
+    if matches!(app, AppType::OpenClaw) {
+        return Err(AppError::InvalidInput(format!(
+            "Skills {action} does not support openclaw yet. Supported apps: {}",
+            supported_app_target_labels()
+        )));
+    }
     Ok(())
 }
 
@@ -267,8 +517,12 @@ fn show_skill_info(spec: &str) -> Result<(), AppError> {
         println!("Desc:      {}", desc);
     }
     println!(
-        "Enabled:   claude={} codex={} gemini={} opencode={}",
-        record.apps.claude, record.apps.codex, record.apps.gemini, record.apps.opencode
+        "Enabled:   claude={} codex={} gemini={} opencode={} hermes={}",
+        record.apps.claude,
+        record.apps.codex,
+        record.apps.gemini,
+        record.apps.opencode,
+        record.apps.hermes
     );
 
     Ok(())

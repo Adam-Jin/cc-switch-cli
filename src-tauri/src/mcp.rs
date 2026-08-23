@@ -386,7 +386,6 @@ pub fn import_from_claude(config: &mut MultiAppConfig) -> Result<usize, AppError
             servers.insert(
                 id.clone(),
                 McpServer {
-                    machine_selector: Default::default(),
                     id: id.clone(),
                     name: id.clone(),
                     server: spec.clone(),
@@ -401,6 +400,7 @@ pub fn import_from_claude(config: &mut MultiAppConfig) -> Result<usize, AppError
                     homepage: None,
                     docs: None,
                     tags: Vec::new(),
+                    machine_selector: Default::default(),
                 },
             );
             changed += 1;
@@ -513,7 +513,9 @@ pub fn import_from_codex(config: &mut MultiAppConfig) -> Result<usize, AppError>
             // 核心字段（需要手动处理的字段）
             let core_fields = match typ {
                 Some("stdio") => vec!["type", "command", "args", "env", "cwd"],
-                Some("http") | Some("sse") => vec!["type", "url", "http_headers"],
+                // DB 中的统一规范使用 headers，Codex TOML 使用 http_headers。
+                // 两者都必须视为核心字段，避免鉴权值落入通用日志路径。
+                Some("http") | Some("sse") => vec!["type", "url", "headers", "http_headers"],
                 _ => vec!["type"],
             };
 
@@ -587,7 +589,7 @@ pub fn import_from_codex(config: &mut MultiAppConfig) -> Result<usize, AppError>
 
                 if let Some(val) = json_val {
                     spec.insert(key.clone(), val);
-                    log::debug!("导入扩展字段 '{key}' = {toml_val:?}");
+                    log::debug!("导入扩展字段 '{key}'（值已省略）");
                 } else {
                     log::debug!("跳过复杂字段 '{key}' (TOML → JSON)");
                 }
@@ -777,7 +779,6 @@ pub fn import_from_gemini(config: &mut MultiAppConfig) -> Result<usize, AppError
             servers.insert(
                 id.clone(),
                 McpServer {
-                    machine_selector: Default::default(),
                     id: id.clone(),
                     name: id.clone(),
                     server: spec.clone(),
@@ -792,6 +793,7 @@ pub fn import_from_gemini(config: &mut MultiAppConfig) -> Result<usize, AppError
                     homepage: None,
                     docs: None,
                     tags: Vec::new(),
+                    machine_selector: Default::default(),
                 },
             );
             changed += 1;
@@ -1217,17 +1219,76 @@ fn json_server_to_toml_table(spec: &Value) -> Result<toml_edit::Table, AppError>
             if let Some(toml_item) = json_value_to_toml_item(value, key) {
                 t[&key[..]] = toml_item;
 
-                // 记录扩展字段的处理
+                // 未知扩展字段同样可能携带 token / secret，只记录字段名。
                 if extended_fields.contains(&key.as_str()) {
-                    log::debug!("已转换扩展字段 '{key}' = {value:?}");
+                    log::debug!("已转换扩展字段 '{key}'（值已省略）");
                 } else {
-                    log::info!("已转换自定义字段 '{key}' = {value:?}");
+                    log::debug!("已转换自定义字段 '{key}'（值已省略）");
                 }
             }
         }
     }
 
     Ok(t)
+}
+
+/// 把单个 MCP server 表写入 `[mcp_servers]`，并保证该键是表。
+///
+/// `config.toml` 允许用户手工编辑。若 `mcp_servers` 是 inline table，
+/// `as_table_mut` 会误判为不可用；若它是标量，直接通过 IndexMut 写入会 panic。
+/// 与上游保持一致，在一个 doc 级辅助函数中统一处理这两种情况。
+fn upsert_mcp_server_table(
+    doc: &mut toml_edit::DocumentMut,
+    id: &str,
+    table: toml_edit::Table,
+) -> Result<(), AppError> {
+    if doc
+        .get_mut("mcp_servers")
+        .and_then(toml_edit::Item::as_table_like_mut)
+        .is_none()
+    {
+        if doc.get("mcp_servers").is_some_and(|item| !item.is_none()) {
+            log::warn!("config.toml 的 mcp_servers 不是表，已重置为空表");
+        }
+        doc["mcp_servers"] = toml_edit::table();
+    }
+
+    let servers = doc
+        .get_mut("mcp_servers")
+        .and_then(toml_edit::Item::as_table_like_mut)
+        .ok_or_else(|| AppError::McpValidation("config.toml 的 mcp_servers 不是表".to_string()))?;
+    servers.insert(id, toml_edit::Item::Table(table));
+    Ok(())
+}
+
+/// 从 `[mcp_servers]` 和历史错误格式 `[mcp.servers]` 中删除单个服务器。
+///
+/// 使用 `as_table_like_mut` 同时支持普通表与合法的 inline table，避免界面
+/// 报告删除成功但 live 配置仍保留该服务器。
+fn remove_mcp_server_from_doc(doc: &mut toml_edit::DocumentMut, id: &str) {
+    if let Some(item) = doc.get_mut("mcp_servers") {
+        let user_authored = !item.is_none();
+        match item.as_table_like_mut() {
+            Some(mcp_servers) => {
+                mcp_servers.remove(id);
+            }
+            None if user_authored => {
+                log::warn!("config.toml 的 mcp_servers 不是表，无法删除服务器 '{id}'");
+            }
+            None => {}
+        }
+    }
+
+    if let Some(mcp_table) = doc.get_mut("mcp").and_then(|item| item.as_table_like_mut()) {
+        if let Some(servers) = mcp_table
+            .get_mut("servers")
+            .and_then(|item| item.as_table_like_mut())
+        {
+            if servers.remove(id).is_some() {
+                log::warn!("从错误的 MCP 格式 [mcp.servers] 中清理了服务器 '{id}'");
+            }
+        }
+    }
 }
 
 /// 将单个 MCP 服务器同步到 Codex live 配置
@@ -1240,22 +1301,17 @@ pub fn sync_single_server_to_codex(
     if !crate::sync_policy::should_sync_live(&AppType::Codex) {
         return Ok(());
     }
-    use toml_edit::Item;
-
     // 读取现有的 config.toml
     let config_path = crate::codex_config::get_codex_config_path();
 
     let mut doc = if config_path.exists() {
         let content =
             std::fs::read_to_string(&config_path).map_err(|e| AppError::io(&config_path, e))?;
-        // 尝试解析现有配置，如果失败则创建新文档（容错处理）
-        match content.parse::<toml_edit::DocumentMut>() {
-            Ok(doc) => doc,
-            Err(e) => {
-                log::warn!("解析 Codex config.toml 失败: {e}，将创建新配置");
-                toml_edit::DocumentMut::new()
-            }
-        }
+        // 解析失败必须报错而不是用空文档顶替：写回空文档会把用户
+        // config.toml 里的其它段落（model/model_providers/注释等）整体清空。
+        content
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| AppError::McpValidation(format!("解析 config.toml 失败: {e}")))?
     } else {
         toml_edit::DocumentMut::new()
     };
@@ -1270,16 +1326,9 @@ pub fn sync_single_server_to_codex(
         }
     }
 
-    // 确保 [mcp_servers] 表存在
-    if !doc.contains_key("mcp_servers") {
-        doc["mcp_servers"] = toml_edit::table();
-    }
-
     // 将 JSON 服务器规范转换为 TOML 表
     let toml_table = json_server_to_toml_table(server_spec)?;
-
-    // 使用唯一正确的格式：[mcp_servers]
-    doc["mcp_servers"][id] = Item::Table(toml_table);
+    upsert_mcp_server_table(&mut doc, id, toml_table)?;
 
     // 写回文件
     let new_text = doc.to_string();
@@ -1312,19 +1361,7 @@ pub fn remove_server_from_codex(id: &str) -> Result<(), AppError> {
         }
     };
 
-    // 从正确的位置删除：[mcp_servers]
-    if let Some(mcp_servers) = doc.get_mut("mcp_servers").and_then(|s| s.as_table_mut()) {
-        mcp_servers.remove(id);
-    }
-
-    // 同时清理可能存在于错误位置的数据：[mcp.servers]（如果存在）
-    if let Some(mcp_table) = doc.get_mut("mcp").and_then(|t| t.as_table_mut()) {
-        if let Some(servers) = mcp_table.get_mut("servers").and_then(|s| s.as_table_mut()) {
-            if servers.remove(id).is_some() {
-                log::warn!("从错误的 MCP 格式 [mcp.servers] 中清理了服务器 '{id}'");
-            }
-        }
-    }
+    remove_mcp_server_from_doc(&mut doc, id);
 
     // 写回文件
     let new_text = doc.to_string();
@@ -1391,4 +1428,566 @@ pub fn remove_server_from_opencode(id: &str) -> Result<(), AppError> {
     }
 
     crate::opencode_config::remove_mcp_server(id)
+}
+
+// ============================================================================
+// Hermes MCP sync / remove / import
+// ============================================================================
+//
+// Behavioural notes (aligned with upstream `mcp/hermes.rs`):
+// - Hermes has NO explicit `type` field; it infers `stdio` from `command`
+//   and `http` from `url`.
+// - Hermes carries extra per-server fields: `enabled` / `timeout` /
+//   `connect_timeout` / `tools` / `sampling` / `roots` / `auth`. These are
+//   preserved on merge-on-write and stripped on import.
+
+/// Hermes-private fields preserved on write and stripped on import.
+const HERMES_EXTRA_FIELDS: &[&str] = &[
+    "enabled",
+    "timeout",
+    "connect_timeout",
+    "tools",
+    "sampling",
+    "roots",
+    "auth",
+];
+
+fn should_sync_hermes_mcp() -> bool {
+    crate::hermes_config::get_hermes_dir().exists()
+}
+
+/// Convert CC Switch's unified MCP format to the Hermes YAML shape.
+fn convert_to_hermes_mcp_spec(spec: &Value) -> Result<Value, AppError> {
+    let obj = spec
+        .as_object()
+        .ok_or_else(|| AppError::McpValidation("MCP spec must be a JSON object".into()))?;
+
+    let typ = obj.get("type").and_then(|v| v.as_str()).unwrap_or("stdio");
+    let mut result = serde_json::Map::new();
+
+    match typ {
+        "stdio" => {
+            if let Some(command) = obj.get("command") {
+                result.insert("command".into(), command.clone());
+            }
+            if let Some(args) = obj.get("args") {
+                if args.is_array() && !args.as_array().map(|a| a.is_empty()).unwrap_or(true) {
+                    result.insert("args".into(), args.clone());
+                }
+            }
+            if let Some(env) = obj.get("env") {
+                if env.is_object() && !env.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+                    result.insert("env".into(), env.clone());
+                }
+            }
+        }
+        "sse" | "http" => {
+            if let Some(url) = obj.get("url") {
+                result.insert("url".into(), url.clone());
+            }
+            if let Some(headers) = obj.get("headers") {
+                if headers.is_object() && !headers.as_object().map(|o| o.is_empty()).unwrap_or(true)
+                {
+                    result.insert("headers".into(), headers.clone());
+                }
+            }
+        }
+        other => {
+            return Err(AppError::McpValidation(format!(
+                "Unknown MCP type: {other}"
+            )));
+        }
+    }
+
+    // Hermes expects an explicit `enabled` flag; default to true on write.
+    result.insert("enabled".into(), json!(true));
+
+    Ok(Value::Object(result))
+}
+
+/// Convert Hermes YAML shape back to CC Switch's unified format, stripping
+/// Hermes-private fields on the import path.
+fn convert_from_hermes_mcp_spec(id: &str, spec: &Value) -> Result<Value, AppError> {
+    let obj = spec
+        .as_object()
+        .ok_or_else(|| AppError::McpValidation("Hermes MCP spec must be a JSON object".into()))?;
+
+    let mut result = serde_json::Map::new();
+
+    if obj.contains_key("command") {
+        result.insert("type".into(), json!("stdio"));
+
+        if let Some(command) = obj.get("command") {
+            result.insert("command".into(), command.clone());
+        }
+        if let Some(args) = obj.get("args") {
+            if args.is_array() && !args.as_array().map(|a| a.is_empty()).unwrap_or(true) {
+                result.insert("args".into(), args.clone());
+            }
+        }
+        if let Some(env) = obj.get("env") {
+            if env.is_object() && !env.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+                result.insert("env".into(), env.clone());
+            }
+        }
+    } else if obj.contains_key("url") {
+        result.insert("type".into(), json!("sse"));
+
+        if let Some(url) = obj.get("url") {
+            result.insert("url".into(), url.clone());
+        }
+        if let Some(headers) = obj.get("headers") {
+            if headers.is_object() && !headers.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+                result.insert("headers".into(), headers.clone());
+            }
+        }
+    } else {
+        return Err(AppError::McpValidation(format!(
+            "Hermes MCP server '{id}' has neither a 'command' nor 'url' field"
+        )));
+    }
+
+    Ok(Value::Object(result))
+}
+
+/// Merge: core fields come from `new_spec`, Hermes-specific fields are
+/// preserved from `existing`.
+fn merge_hermes_spec(existing: &Value, new_spec: &Value) -> Value {
+    let mut result = serde_json::Map::new();
+
+    if let Some(existing_obj) = existing.as_object() {
+        for &field in HERMES_EXTRA_FIELDS {
+            if let Some(val) = existing_obj.get(field) {
+                result.insert(field.to_string(), val.clone());
+            }
+        }
+    }
+
+    if let Some(new_obj) = new_spec.as_object() {
+        for (key, val) in new_obj {
+            if HERMES_EXTRA_FIELDS.contains(&key.as_str()) && result.contains_key(key) {
+                continue; // Existing Hermes-private fields win.
+            }
+            result.insert(key.clone(), val.clone());
+        }
+    }
+
+    Value::Object(result)
+}
+
+/// Sync a single MCP server to the Hermes live config using
+/// merge-on-write semantics (preserves Hermes-private fields).
+pub fn sync_single_server_to_hermes(
+    _config: &MultiAppConfig,
+    id: &str,
+    server_spec: &Value,
+) -> Result<(), AppError> {
+    if !crate::sync_policy::should_sync_live(&AppType::Hermes) {
+        return Ok(());
+    }
+    if !should_sync_hermes_mcp() {
+        return Ok(());
+    }
+
+    let hermes_spec = convert_to_hermes_mcp_spec(server_spec)?;
+    let id_owned = id.to_string();
+
+    crate::hermes_config::update_mcp_servers_yaml(|servers| {
+        let id_yaml = serde_yaml::Value::String(id_owned.clone());
+
+        let merged_json = if let Some(existing_yaml) = servers.get(&id_yaml) {
+            let existing_json = crate::hermes_config::yaml_to_json(existing_yaml)?;
+            merge_hermes_spec(&existing_json, &hermes_spec)
+        } else {
+            hermes_spec.clone()
+        };
+
+        let merged_yaml_value = crate::hermes_config::json_to_yaml(&merged_json)?;
+        servers.insert(id_yaml, merged_yaml_value);
+        Ok(())
+    })
+}
+
+/// Remove a single MCP server from the Hermes live config.
+pub fn remove_server_from_hermes(id: &str) -> Result<(), AppError> {
+    if !crate::sync_policy::should_sync_live(&AppType::Hermes) {
+        return Ok(());
+    }
+    if !should_sync_hermes_mcp() {
+        return Ok(());
+    }
+
+    let id_owned = id.to_string();
+    crate::hermes_config::update_mcp_servers_yaml(|servers| {
+        servers.remove(serde_yaml::Value::String(id_owned.clone()));
+        Ok(())
+    })
+}
+
+/// Import MCP servers from the Hermes `mcp_servers:` section into the
+/// unified store.
+pub fn import_from_hermes(config: &mut MultiAppConfig) -> Result<usize, AppError> {
+    use crate::app_config::{McpApps, McpServer};
+
+    let yaml_map = crate::hermes_config::get_mcp_servers_yaml()?;
+    if yaml_map.is_empty() {
+        return Ok(0);
+    }
+
+    if config.mcp.servers.is_none() {
+        config.mcp.servers = Some(HashMap::new());
+    }
+    let servers = config.mcp.servers.as_mut().unwrap();
+
+    let mut changed = 0usize;
+    let mut errors = Vec::new();
+
+    for (key, spec_yaml) in &yaml_map {
+        let id = match key.as_str() {
+            Some(s) => s.to_string(),
+            None => {
+                log::warn!("Skipping Hermes MCP server with non-string key");
+                continue;
+            }
+        };
+
+        let spec_json = match crate::hermes_config::yaml_to_json(spec_yaml) {
+            Ok(j) => j,
+            Err(e) => {
+                log::warn!("Skipping Hermes MCP '{id}': YAML->JSON conversion failed: {e}");
+                errors.push(format!("{id}: {e}"));
+                continue;
+            }
+        };
+
+        let unified_spec = match convert_from_hermes_mcp_spec(&id, &spec_json) {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("Skipping invalid Hermes MCP '{id}': {e}");
+                errors.push(format!("{id}: {e}"));
+                continue;
+            }
+        };
+
+        if let Err(e) = validate_server_spec(&unified_spec) {
+            log::warn!("Skipping MCP '{id}' that remained invalid after conversion: {e}");
+            errors.push(format!("{id}: {e}"));
+            continue;
+        }
+
+        if let Some(existing) = servers.get_mut(&id) {
+            if !existing.apps.hermes {
+                existing.apps.hermes = true;
+                changed += 1;
+                log::info!("MCP server '{id}' enabled for Hermes");
+            }
+        } else {
+            servers.insert(
+                id.clone(),
+                McpServer {
+                    id: id.clone(),
+                    name: id.clone(),
+                    server: unified_spec,
+                    apps: McpApps {
+                        claude: false,
+                        codex: false,
+                        gemini: false,
+                        opencode: false,
+                        hermes: true,
+                    },
+                    description: None,
+                    homepage: None,
+                    docs: None,
+                    tags: Vec::new(),
+                    machine_selector: Default::default(),
+                },
+            );
+            changed += 1;
+            log::info!("Imported new MCP server '{id}' from Hermes");
+        }
+    }
+
+    if !errors.is_empty() {
+        log::warn!(
+            "Hermes MCP import finished with {} failure(s): {:?}",
+            errors.len(),
+            errors
+        );
+    }
+
+    Ok(changed)
+}
+
+#[cfg(test)]
+mod codex_mcp_tests {
+    use super::*;
+
+    #[test]
+    fn upsert_normalizes_non_table_mcp_servers_without_panicking() {
+        for malformed in [
+            "mcp_servers = \"x\"\n",
+            "mcp_servers = []\n",
+            "mcp_servers = 42\n",
+        ] {
+            let mut doc = malformed
+                .parse::<toml_edit::DocumentMut>()
+                .expect("fixture parses");
+            let table = json_server_to_toml_table(&json!({
+                "type": "stdio",
+                "command": "npx"
+            }))
+            .expect("server table");
+
+            upsert_mcp_server_table(&mut doc, "echo", table)
+                .unwrap_or_else(|error| panic!("upsert must not fail for {malformed:?}: {error}"));
+
+            let servers = doc
+                .get("mcp_servers")
+                .and_then(toml_edit::Item::as_table_like)
+                .expect("mcp_servers must be normalized to a table");
+            assert!(servers.contains_key("echo"));
+        }
+    }
+
+    #[test]
+    fn upsert_preserves_existing_servers_in_a_valid_table() {
+        let mut doc = "[mcp_servers.keep]\ncommand = \"keep\"\n"
+            .parse::<toml_edit::DocumentMut>()
+            .expect("fixture parses");
+        let table = json_server_to_toml_table(&json!({
+            "type": "stdio",
+            "command": "npx"
+        }))
+        .expect("server table");
+
+        upsert_mcp_server_table(&mut doc, "added", table).expect("upsert");
+
+        let servers = doc
+            .get("mcp_servers")
+            .and_then(toml_edit::Item::as_table_like)
+            .expect("table");
+        assert!(servers.contains_key("keep"), "existing server must survive");
+        assert!(servers.contains_key("added"));
+    }
+
+    #[test]
+    fn upsert_preserves_existing_servers_in_an_inline_table() {
+        let mut doc = "mcp_servers = { keep = { command = \"keep\" } }\n"
+            .parse::<toml_edit::DocumentMut>()
+            .expect("fixture parses");
+        let table = json_server_to_toml_table(&json!({
+            "type": "stdio",
+            "command": "npx"
+        }))
+        .expect("server table");
+
+        upsert_mcp_server_table(&mut doc, "added", table).expect("upsert");
+
+        let servers = doc
+            .get("mcp_servers")
+            .and_then(toml_edit::Item::as_table_like)
+            .expect("inline table");
+        assert!(servers.contains_key("keep"), "existing server must survive");
+        assert!(servers.contains_key("added"));
+    }
+
+    #[test]
+    fn remove_deletes_from_inline_table_form_too() {
+        let mut doc = "mcp_servers = { drop = { command = \"x\" }, keep = { command = \"y\" } }\n"
+            .parse::<toml_edit::DocumentMut>()
+            .expect("fixture parses");
+
+        remove_mcp_server_from_doc(&mut doc, "drop");
+
+        let servers = doc
+            .get("mcp_servers")
+            .and_then(toml_edit::Item::as_table_like)
+            .expect("mcp_servers must still be table-like");
+        assert!(!servers.contains_key("drop"));
+        assert!(servers.contains_key("keep"), "siblings must survive");
+    }
+
+    #[test]
+    fn remove_is_a_noop_on_non_table_mcp_servers() {
+        let mut doc = "mcp_servers = 42\n"
+            .parse::<toml_edit::DocumentMut>()
+            .expect("fixture parses");
+
+        remove_mcp_server_from_doc(&mut doc, "whatever");
+
+        assert_eq!(doc.to_string(), "mcp_servers = 42\n");
+    }
+
+    #[test]
+    fn http_headers_are_only_written_to_codex_http_headers() {
+        let table = json_server_to_toml_table(&json!({
+            "type": "http",
+            "url": "https://mcp.example.com",
+            "headers": {
+                "Authorization": "Bearer top-secret",
+                "X-Api-Key": "also-secret"
+            },
+            "timeout": 30
+        }))
+        .expect("server table");
+
+        let headers = table
+            .get("http_headers")
+            .and_then(toml_edit::Item::as_table)
+            .expect("Codex http_headers table should be written");
+        assert_eq!(
+            headers
+                .get("Authorization")
+                .and_then(toml_edit::Item::as_str),
+            Some("Bearer top-secret")
+        );
+        assert!(
+            table.get("headers").is_none(),
+            "legacy headers must not be emitted a second time"
+        );
+        assert_eq!(
+            table.get("timeout").and_then(toml_edit::Item::as_integer),
+            Some(30)
+        );
+    }
+}
+
+#[cfg(test)]
+mod hermes_mcp_tests {
+    use super::*;
+
+    #[test]
+    fn convert_stdio_to_hermes() {
+        let spec = json!({
+            "type": "stdio",
+            "command": "npx",
+            "args": ["-y", "@modelcontextprotocol/server-filesystem"],
+            "env": { "HOME": "/Users/test" }
+        });
+        let result = convert_to_hermes_mcp_spec(&spec).unwrap();
+        assert!(result.get("type").is_none());
+        assert_eq!(result["command"], "npx");
+        assert_eq!(result["args"][0], "-y");
+        assert_eq!(result["env"]["HOME"], "/Users/test");
+        assert_eq!(result["enabled"], true);
+    }
+
+    #[test]
+    fn convert_sse_to_hermes() {
+        let spec = json!({
+            "type": "sse",
+            "url": "https://example.com/mcp",
+            "headers": { "Authorization": "Bearer xxx" }
+        });
+        let result = convert_to_hermes_mcp_spec(&spec).unwrap();
+        assert!(result.get("type").is_none());
+        assert_eq!(result["url"], "https://example.com/mcp");
+        assert_eq!(result["headers"]["Authorization"], "Bearer xxx");
+        assert_eq!(result["enabled"], true);
+    }
+
+    #[test]
+    fn convert_stdio_empty_collections_are_omitted() {
+        let spec = json!({
+            "type": "stdio",
+            "command": "node",
+            "args": [],
+            "env": {}
+        });
+        let result = convert_to_hermes_mcp_spec(&spec).unwrap();
+        assert_eq!(result["command"], "node");
+        assert!(result.get("args").is_none());
+        assert!(result.get("env").is_none());
+    }
+
+    #[test]
+    fn convert_from_hermes_stdio_strips_extras() {
+        let spec = json!({
+            "command": "npx",
+            "args": ["-y", "x"],
+            "env": { "HOME": "/Users/test" },
+            "enabled": true,
+            "timeout": 30,
+            "connect_timeout": 10,
+            "tools": { "include": ["read_file"] },
+            "sampling": { "enabled": true }
+        });
+        let result = convert_from_hermes_mcp_spec("fs", &spec).unwrap();
+        assert_eq!(result["type"], "stdio");
+        assert_eq!(result["command"], "npx");
+        assert!(result.get("enabled").is_none());
+        assert!(result.get("timeout").is_none());
+        assert!(result.get("connect_timeout").is_none());
+        assert!(result.get("tools").is_none());
+        assert!(result.get("sampling").is_none());
+    }
+
+    #[test]
+    fn convert_from_hermes_http_strips_extras_and_auth() {
+        let spec = json!({
+            "url": "https://mcp.example.com",
+            "auth": "oauth",
+            "enabled": true,
+            "timeout": 60
+        });
+        let result = convert_from_hermes_mcp_spec("remote", &spec).unwrap();
+        assert_eq!(result["type"], "sse");
+        assert_eq!(result["url"], "https://mcp.example.com");
+        assert!(
+            result.get("auth").is_none(),
+            "auth must be stripped on import"
+        );
+        assert!(result.get("enabled").is_none());
+    }
+
+    #[test]
+    fn convert_from_hermes_missing_endpoint_errors() {
+        let spec = json!({ "enabled": true, "timeout": 30 });
+        assert!(convert_from_hermes_mcp_spec("bad", &spec).is_err());
+    }
+
+    #[test]
+    fn merge_preserves_hermes_extra_fields() {
+        let existing = json!({
+            "command": "old-cmd",
+            "args": ["old-arg"],
+            "enabled": true,
+            "timeout": 30,
+            "connect_timeout": 10,
+            "tools": { "include": ["read_file"] },
+            "sampling": { "enabled": true }
+        });
+        let new_spec = json!({
+            "command": "new-cmd",
+            "args": ["new-arg"],
+            "env": { "KEY": "value" },
+            "enabled": true
+        });
+        let merged = merge_hermes_spec(&existing, &new_spec);
+        assert_eq!(merged["command"], "new-cmd");
+        assert_eq!(merged["args"][0], "new-arg");
+        assert_eq!(merged["env"]["KEY"], "value");
+        assert_eq!(merged["timeout"], 30);
+        assert_eq!(merged["connect_timeout"], 10);
+        assert_eq!(merged["tools"]["include"][0], "read_file");
+        assert_eq!(merged["sampling"]["enabled"], true);
+    }
+
+    #[test]
+    fn merge_preserves_auth_field_on_roundtrip() {
+        let existing = json!({
+            "url": "https://mcp.example.com",
+            "auth": "oauth",
+            "enabled": true
+        });
+        let new_spec = json!({
+            "url": "https://mcp.example.com/updated",
+            "headers": { "X-Trace": "abc" },
+            "enabled": true
+        });
+        let merged = merge_hermes_spec(&existing, &new_spec);
+        assert_eq!(merged["url"], "https://mcp.example.com/updated");
+        assert_eq!(merged["headers"]["X-Trace"], "abc");
+        assert_eq!(merged["auth"], "oauth");
+    }
 }

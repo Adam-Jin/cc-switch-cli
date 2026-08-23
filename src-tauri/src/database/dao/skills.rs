@@ -22,14 +22,14 @@ impl Database {
         let mut stmt = conn
             .prepare(
                 "SELECT id, name, description, directory, repo_owner, repo_name, repo_branch,
-                        readme_url, enabled_claude, enabled_codex, enabled_gemini, enabled_opencode, installed_at, machine_selector
+                        readme_url, enabled_claude, enabled_codex, enabled_gemini, enabled_opencode, enabled_hermes,
+                        installed_at, content_hash, updated_at, machine_selector
                  FROM skills ORDER BY name ASC",
             )
             .map_err(|e| AppError::Database(e.to_string()))?;
 
         let skill_iter = stmt
             .query_map([], |row| {
-                let machine_selector_str: String = row.get(13)?;
                 Ok(InstalledSkill {
                     id: row.get(0)?,
                     name: row.get(1)?,
@@ -44,10 +44,13 @@ impl Database {
                         codex: row.get(9)?,
                         gemini: row.get(10)?,
                         opencode: row.get(11)?,
+                        hermes: row.get(12)?,
                     },
-                    machine_selector: serde_json::from_str(&machine_selector_str)
+                    installed_at: row.get(13)?,
+                    content_hash: row.get(14)?,
+                    updated_at: row.get(15)?,
+                    machine_selector: serde_json::from_str(&row.get::<_, String>(16)?)
                         .unwrap_or_default(),
-                    installed_at: row.get(12)?,
                 })
             })
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -66,13 +69,13 @@ impl Database {
         let mut stmt = conn
             .prepare(
                 "SELECT id, name, description, directory, repo_owner, repo_name, repo_branch,
-                        readme_url, enabled_claude, enabled_codex, enabled_gemini, enabled_opencode, installed_at, machine_selector
+                        readme_url, enabled_claude, enabled_codex, enabled_gemini, enabled_opencode, enabled_hermes,
+                        installed_at, content_hash, updated_at, machine_selector
                  FROM skills WHERE id = ?1",
             )
             .map_err(|e| AppError::Database(e.to_string()))?;
 
         let result = stmt.query_row([id], |row| {
-            let machine_selector_str: String = row.get(13)?;
             Ok(InstalledSkill {
                 id: row.get(0)?,
                 name: row.get(1)?,
@@ -87,9 +90,13 @@ impl Database {
                     codex: row.get(9)?,
                     gemini: row.get(10)?,
                     opencode: row.get(11)?,
+                    hermes: row.get(12)?,
                 },
-                machine_selector: serde_json::from_str(&machine_selector_str).unwrap_or_default(),
-                installed_at: row.get(12)?,
+                installed_at: row.get(13)?,
+                content_hash: row.get(14)?,
+                updated_at: row.get(15)?,
+                machine_selector: serde_json::from_str(&row.get::<_, String>(16)?)
+                    .unwrap_or_default(),
             })
         });
 
@@ -104,10 +111,28 @@ impl Database {
     pub fn save_skill(&self, skill: &InstalledSkill) -> Result<(), AppError> {
         let conn = lock_conn!(self.conn);
         conn.execute(
-            "INSERT OR REPLACE INTO skills
+            "INSERT INTO skills
              (id, name, description, directory, repo_owner, repo_name, repo_branch,
-              readme_url, enabled_claude, enabled_codex, enabled_gemini, enabled_opencode, installed_at, machine_selector)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+              readme_url, enabled_claude, enabled_codex, enabled_gemini, enabled_opencode, enabled_hermes,
+              installed_at, content_hash, updated_at, machine_selector)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+             ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name,
+                description = excluded.description,
+                directory = excluded.directory,
+                repo_owner = excluded.repo_owner,
+                repo_name = excluded.repo_name,
+                repo_branch = excluded.repo_branch,
+                readme_url = excluded.readme_url,
+                enabled_claude = excluded.enabled_claude,
+                enabled_codex = excluded.enabled_codex,
+                enabled_gemini = excluded.enabled_gemini,
+                enabled_opencode = excluded.enabled_opencode,
+                enabled_hermes = excluded.enabled_hermes,
+                installed_at = excluded.installed_at,
+                content_hash = excluded.content_hash,
+                updated_at = excluded.updated_at,
+                machine_selector = excluded.machine_selector",
             params![
                 skill.id,
                 skill.name,
@@ -121,7 +146,10 @@ impl Database {
                 skill.apps.codex,
                 skill.apps.gemini,
                 skill.apps.opencode,
+                skill.apps.hermes,
                 skill.installed_at,
+                skill.content_hash,
+                skill.updated_at,
                 serde_json::to_string(&skill.machine_selector).map_err(|e| AppError::Database(
                     format!("Failed to serialize machine selector: {e}")
                 ))?,
@@ -153,8 +181,25 @@ impl Database {
         let conn = lock_conn!(self.conn);
         let affected = conn
             .execute(
-                "UPDATE skills SET enabled_claude = ?1, enabled_codex = ?2, enabled_gemini = ?3, enabled_opencode = ?4 WHERE id = ?5",
-                params![apps.claude, apps.codex, apps.gemini, apps.opencode, id],
+                "UPDATE skills SET enabled_claude = ?1, enabled_codex = ?2, enabled_gemini = ?3, enabled_opencode = ?4, enabled_hermes = ?5 WHERE id = ?6",
+                params![apps.claude, apps.codex, apps.gemini, apps.opencode, apps.hermes, id],
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(affected > 0)
+    }
+
+    /// 更新 Skill 的内容哈希和更新时间。
+    pub fn update_skill_hash(
+        &self,
+        id: &str,
+        content_hash: &str,
+        updated_at: i64,
+    ) -> Result<bool, AppError> {
+        let conn = lock_conn!(self.conn);
+        let affected = conn
+            .execute(
+                "UPDATE skills SET content_hash = ?1, updated_at = ?2 WHERE id = ?3",
+                params![content_hash, updated_at, id],
             )
             .map_err(|e| AppError::Database(e.to_string()))?;
         Ok(affected > 0)
@@ -238,5 +283,50 @@ impl Database {
             log::info!("补充默认 Skill 仓库完成，新增 {count} 个");
         }
         Ok(count)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skill_hash_fields_round_trip_without_schema_changes() {
+        let home = tempfile::tempdir().expect("create isolated home");
+        let _env = crate::test_support::TestEnvGuard::isolated(home.path());
+        let db = Database::init().expect("initialize database");
+        let skill = InstalledSkill {
+            id: "owner/repo:demo".to_string(),
+            name: "Demo".to_string(),
+            description: None,
+            directory: "demo".to_string(),
+            repo_owner: Some("owner".to_string()),
+            repo_name: Some("repo".to_string()),
+            repo_branch: Some("main".to_string()),
+            readme_url: None,
+            apps: SkillApps::default(),
+            installed_at: 1,
+            content_hash: Some("before".to_string()),
+            updated_at: 2,
+            machine_selector: Default::default(),
+        };
+
+        db.save_skill(&skill).expect("save skill hash fields");
+        let stored = db
+            .get_installed_skill(&skill.id)
+            .expect("read skill")
+            .expect("stored skill");
+        assert_eq!(stored.content_hash.as_deref(), Some("before"));
+        assert_eq!(stored.updated_at, 2);
+
+        assert!(db
+            .update_skill_hash(&skill.id, "after", 3)
+            .expect("update hash fields"));
+        let updated = db
+            .get_installed_skill(&skill.id)
+            .expect("read updated skill")
+            .expect("updated skill");
+        assert_eq!(updated.content_hash.as_deref(), Some("after"));
+        assert_eq!(updated.updated_at, 3);
     }
 }

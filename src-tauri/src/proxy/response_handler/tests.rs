@@ -1,4 +1,4 @@
-use std::{collections::HashMap, env, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use axum::{
     body::{to_bytes, Body},
@@ -15,60 +15,14 @@ use crate::{
     app_config::AppType,
     database::Database,
     provider::Provider,
-    proxy::{provider_router::ProviderRouter, types::ProxyConfig},
+    proxy::{
+        provider_router::ProviderRouter, providers::gemini_shadow::GeminiShadowStore,
+        types::ProxyConfig,
+    },
+    test_support::TestEnvGuard,
 };
 
 use super::*;
-
-struct TempHome {
-    #[allow(dead_code)]
-    dir: TempDir,
-    original_home: Option<String>,
-    original_userprofile: Option<String>,
-    original_config_dir: Option<String>,
-}
-
-impl TempHome {
-    fn new() -> Self {
-        let dir = TempDir::new().expect("create temp home");
-        let original_home = env::var("HOME").ok();
-        let original_userprofile = env::var("USERPROFILE").ok();
-        let original_config_dir = env::var("CC_SWITCH_CONFIG_DIR").ok();
-
-        env::set_var("HOME", dir.path());
-        env::set_var("USERPROFILE", dir.path());
-        env::set_var("CC_SWITCH_CONFIG_DIR", dir.path().join(".cc-switch"));
-        crate::settings::reload_test_settings();
-
-        Self {
-            dir,
-            original_home,
-            original_userprofile,
-            original_config_dir,
-        }
-    }
-}
-
-impl Drop for TempHome {
-    fn drop(&mut self) {
-        match &self.original_home {
-            Some(value) => env::set_var("HOME", value),
-            None => env::remove_var("HOME"),
-        }
-
-        match &self.original_userprofile {
-            Some(value) => env::set_var("USERPROFILE", value),
-            None => env::remove_var("USERPROFILE"),
-        }
-
-        match &self.original_config_dir {
-            Some(value) => env::set_var("CC_SWITCH_CONFIG_DIR", value),
-            None => env::remove_var("CC_SWITCH_CONFIG_DIR"),
-        }
-
-        crate::settings::reload_test_settings();
-    }
-}
 
 fn test_provider_with_settings(
     id: &str,
@@ -99,6 +53,8 @@ fn test_state_with_db(db: Arc<Database>) -> ProxyServerState {
         start_time: Arc::new(RwLock::new(None)),
         current_providers: Arc::new(RwLock::new(HashMap::new())),
         provider_router: Arc::new(ProviderRouter::new(db)),
+        codex_chat_history: Arc::new(Default::default()),
+        gemini_shadow: Arc::new(GeminiShadowStore::default()),
     }
 }
 
@@ -261,7 +217,8 @@ async fn buffered_success_streaming_responses_do_not_record_termination_error() 
 #[tokio::test]
 #[serial(home_settings)]
 async fn streaming_success_syncs_failover_state_after_body_drains() {
-    let _home = TempHome::new();
+    let temp_home = TempDir::new().expect("create temp home");
+    let _env = TestEnvGuard::isolated(temp_home.path());
     let db = Arc::new(Database::memory().expect("memory db"));
     let current = test_provider_with_settings(
         "claude-current",
@@ -322,7 +279,22 @@ async fn streaming_success_syncs_failover_state_after_body_drains() {
     .await;
 
     let status = state.snapshot_status().await;
-    assert_eq!(status.current_provider_id, None);
+    assert_eq!(
+        status.current_provider_id.as_deref(),
+        Some("claude-failover")
+    );
+    assert_eq!(status.failover_count, 0);
+    assert_eq!(
+        db.get_current_provider("claude")
+            .expect("read current provider before drain")
+            .as_deref(),
+        Some("claude-current")
+    );
+    assert!(db
+        .get_failover_live_snapshot("claude", "claude-failover")
+        .await
+        .expect("read failover snapshot before drain")
+        .is_none());
 
     let _ = to_bytes(response.into_body(), usize::MAX)
         .await
@@ -334,6 +306,7 @@ async fn streaming_success_syncs_failover_state_after_body_drains() {
         status.current_provider_id.as_deref(),
         Some("claude-failover")
     );
+    assert_eq!(status.failover_count, 1);
     assert_eq!(
         db.get_current_provider("claude")
             .expect("read current provider")
@@ -356,6 +329,100 @@ async fn streaming_success_syncs_failover_state_after_body_drains() {
         backup_snapshot
             .get("base_url")
             .and_then(serde_json::Value::as_str),
+        Some("https://current.example")
+    );
+
+    let snapshot = db
+        .get_failover_live_snapshot("claude", "claude-failover")
+        .await
+        .expect("read failover snapshot")
+        .expect("failover snapshot should exist");
+    let snapshot_value: serde_json::Value =
+        serde_json::from_str(&snapshot.config_json).expect("parse failover snapshot");
+    assert_eq!(
+        snapshot_value
+            .get("base_url")
+            .and_then(serde_json::Value::as_str),
         Some("https://failover.example")
+    );
+}
+
+#[tokio::test]
+#[serial(home_settings)]
+async fn interrupted_stream_exposes_target_without_persisting_failover() {
+    let temp_home = TempDir::new().expect("create temp home");
+    let _env = TestEnvGuard::isolated(temp_home.path());
+    let db = Arc::new(Database::memory().expect("memory db"));
+    let current = test_provider_with_settings(
+        "claude-current",
+        "Claude Current",
+        json!({"apiKey": "current-key", "base_url": "https://current.example"}),
+    );
+    let failover = test_provider_with_settings(
+        "claude-failover",
+        "Claude Failover",
+        json!({"apiKey": "failover-key", "base_url": "https://failover.example"}),
+    );
+
+    db.save_provider("claude", &current)
+        .expect("save current provider");
+    db.save_provider("claude", &failover)
+        .expect("save failover provider");
+    db.set_current_provider("claude", &current.id)
+        .expect("set current provider");
+    crate::settings::set_current_provider(&AppType::Claude, Some(&current.id))
+        .expect("set local current provider");
+
+    let state = test_state_with_db(db.clone());
+    state.record_request_start().await;
+    let stream = async_stream::stream! {
+        yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b"partial"));
+        yield Err::<Bytes, std::io::Error>(std::io::Error::other("stream broke"));
+    };
+    let response = PreparedResponse {
+        response: Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::from_stream(stream))
+            .expect("response"),
+        stream_completion: None,
+        estimated_output_tokens: 0,
+        upstream_error_summary: None,
+        body_bytes: None,
+    };
+
+    let response = ResponseHandler::finish_streaming(
+        &state,
+        Ok(response),
+        reqwest::StatusCode::OK,
+        Some(SuccessSyncInfo {
+            app_type: AppType::Claude,
+            provider: failover,
+            current_provider_id_at_start: current.id.clone(),
+        }),
+        None,
+    )
+    .await;
+
+    assert_eq!(
+        state.snapshot_status().await.current_provider_id.as_deref(),
+        Some("claude-failover")
+    );
+
+    let _ = to_bytes(response.into_body(), usize::MAX).await;
+    settle_tasks().await;
+
+    let status = state.snapshot_status().await;
+    assert_eq!(status.failover_count, 0);
+    assert_eq!(status.success_requests, 0);
+    assert_eq!(status.failed_requests, 1);
+    assert_eq!(
+        db.get_current_provider("claude")
+            .expect("read current provider")
+            .as_deref(),
+        Some("claude-current")
+    );
+    assert_eq!(
+        crate::settings::get_current_provider(&AppType::Claude).as_deref(),
+        Some("claude-current")
     );
 }

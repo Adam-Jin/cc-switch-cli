@@ -3,14 +3,46 @@ use super::*;
 #[derive(Debug, Clone)]
 pub enum Action {
     None,
+    #[allow(dead_code)]
     ReloadData,
     SwitchRoute(Route),
     Quit,
     SetAppType(AppType),
     LocalEnvRefresh,
-    /// 设置本机手动标签（机器作用域 selector 的匹配依据之一）
     MachineLabelsSet {
         labels: Vec<String>,
+    },
+    CopyToClipboard {
+        text: String,
+    },
+
+    SessionsRefresh,
+    SessionsDeepSearch {
+        query: String,
+    },
+    SessionsDeepSearchCancel,
+    SessionsProjectCatalogLoad,
+    SessionsProjectFilter {
+        query: String,
+    },
+    SessionsProjectFilterCancel,
+    SessionsProjectApply {
+        scope: crate::session_manager::project_scope::SessionProjectScope,
+    },
+    SessionMessagesLoad {
+        key: String,
+        provider_id: String,
+        source_path: String,
+    },
+    SessionResume {
+        command: String,
+        cwd: Option<String>,
+    },
+    SessionDelete {
+        key: String,
+        provider_id: String,
+        session_id: String,
+        source_path: String,
     },
 
     SkillsToggle {
@@ -28,6 +60,10 @@ pub enum Action {
     SkillsInstall {
         spec: String,
     },
+    SkillsCheckUpdates,
+    SkillsUpdate {
+        ids: Vec<String>,
+    },
     SkillsUninstall {
         directory: String,
     },
@@ -39,6 +75,8 @@ pub enum Action {
     },
     SkillsDiscover {
         query: String,
+        source: SkillsDiscoverSource,
+        force: bool,
     },
     SkillsRepoAdd {
         spec: String,
@@ -53,9 +91,10 @@ pub enum Action {
         enabled: bool,
     },
     SkillsOpenImport,
+    #[allow(dead_code)]
     SkillsScanUnmanaged,
     SkillsImportFromApps {
-        directories: Vec<String>,
+        imports: Vec<crate::services::skill::ImportSkillSelection>,
     },
 
     ProviderSwitch {
@@ -94,9 +133,39 @@ pub enum Action {
     },
     ProviderModelFetch {
         base_url: String,
+        is_full_url: bool,
         api_key: Option<String>,
+        custom_user_agent: Option<String>,
+        codex_oauth: bool,
+        codex_oauth_account_id: Option<String>,
         field: ProviderAddField,
         claude_idx: Option<usize>,
+    },
+    UsageCustomRange {
+        range: data::UsageCustomRange,
+    },
+    UsageRefresh,
+    UsageRebuildCodex,
+    UsageLogDetailRefresh {
+        rowid: i64,
+    },
+    PricingDelete {
+        model_id: String,
+    },
+
+    ManagedAuthRefresh {
+        auth_provider: String,
+    },
+    ManagedAuthStartLogin {
+        auth_provider: String,
+    },
+    ManagedAuthSetDefault {
+        auth_provider: String,
+        account_id: String,
+    },
+    ManagedAuthRemove {
+        auth_provider: String,
+        account_id: String,
     },
 
     McpToggle {
@@ -122,12 +191,27 @@ pub enum Action {
     PromptDeactivate {
         id: String,
     },
-    PromptRename {
-        id: String,
+    #[allow(dead_code)]
+    PromptUpdateMetadata {
+        old_id: String,
+        new_id: String,
         name: String,
+        description: Option<String>,
+    },
+    PromptSave {
+        old_id: Option<String>,
+        new_id: String,
+        name: String,
+        description: Option<String>,
+        content: String,
     },
     PromptDelete {
         id: String,
+    },
+    PromptFormOpenExternal,
+    PromptOpenImportCandidate {
+        filename: String,
+        content: String,
     },
 
     ConfigExport {
@@ -145,21 +229,36 @@ pub enum Action {
     ConfigShowFull,
     ConfigValidate,
     ConfigOpenProxyHelp,
-    ConfigCommonSnippetClear {
-        app_type: AppType,
-    },
-    ConfigCommonSnippetApply {
-        app_type: AppType,
-    },
+    ConfirmCommonConfigNotice,
+    ConfirmUsageQueryNotice,
     ConfigWebDavCheckConnection,
+    ConfigWebDavSave {
+        settings: crate::settings::WebDavSyncSettings,
+    },
     ConfigWebDavUpload,
     ConfigWebDavDownload,
     ConfigWebDavMigrateV1ToV2,
     ConfigWebDavReset,
+    ConfigWebDavSetEnabled {
+        enabled: bool,
+    },
     ConfigWebDavJianguoyunQuickSetup {
         username: String,
         password: String,
     },
+    ConfigS3Save {
+        settings: crate::settings::S3SyncSettings,
+    },
+    ConfigS3CheckConnection,
+    ConfigS3FetchRemoteInfo {
+        intent: CloudSyncTransferIntent,
+    },
+    ConfigS3Upload,
+    ConfigS3Download,
+    ConfigS3SetEnabled {
+        enabled: bool,
+    },
+    ConfigS3Reset,
     OpenClawWorkspaceOpenFile {
         filename: String,
     },
@@ -175,6 +274,14 @@ pub enum Action {
     OpenClawOpenDirectory {
         subdir: String,
     },
+    HermesMemoryOpen {
+        kind: crate::hermes_config::MemoryKind,
+    },
+    HermesMemorySetEnabled {
+        kind: crate::hermes_config::MemoryKind,
+        enabled: bool,
+    },
+    HermesOpenMemoryDirectory,
     ConfigReset,
 
     EditorSubmit {
@@ -183,6 +290,12 @@ pub enum Action {
     },
     EditorDiscard,
     EditorOpenExternal,
+    EditorFormatCommonSnippet {
+        app_type: AppType,
+    },
+    EditorExtractCommonSnippet {
+        app_type: AppType,
+    },
 
     SetSkipClaudeOnboarding {
         enabled: bool,
@@ -190,6 +303,15 @@ pub enum Action {
     SetClaudePluginIntegration {
         enabled: bool,
     },
+    SetPreserveCodexOfficialAuth {
+        enabled: bool,
+    },
+    SetCodexUnifiedSessionHistory {
+        enabled: bool,
+        migrate_existing: bool,
+        restore_after_disable: bool,
+    },
+    #[allow(dead_code)]
     SetProxyEnabled {
         enabled: bool,
     },
@@ -203,20 +325,35 @@ pub enum Action {
         app_type: AppType,
         enabled: bool,
     },
+    SetGlobalOutboundProxy {
+        config: crate::services::GlobalOutboundProxyConfig,
+    },
+    EnableProxyAndAutoFailover {
+        app_type: AppType,
+    },
     SetOpenClawConfigDir {
         path: Option<String>,
     },
-    SetProxyTakeover {
-        app_type: AppType,
-        enabled: bool,
+    SetPreferredEditor {
+        command: Option<String>,
     },
     SetManagedProxyForCurrentApp {
         app_type: AppType,
         enabled: bool,
     },
     SetLanguage(Language),
+    SetVisibleAppsMode {
+        mode: crate::settings::VisibleAppsMode,
+    },
     SetVisibleApps {
         apps: crate::settings::VisibleApps,
+    },
+    ConfirmVisibleAppsAutoDetection {
+        use_auto: bool,
+    },
+    SwitchVisibleAppsToManual {
+        apps: crate::settings::VisibleApps,
+        selected: usize,
     },
 
     CheckUpdate,
@@ -235,12 +372,13 @@ pub enum ConfigItem {
     Restore,
     Validate,
     CommonSnippet,
+    #[allow(dead_code)]
     Proxy,
     OpenClawWorkspace,
     OpenClawEnv,
     OpenClawTools,
     OpenClawAgents,
-    WebDavSync,
+    CloudSync,
     Reset,
 }
 
@@ -288,7 +426,7 @@ impl ConfigItem {
         ConfigItem::OpenClawEnv,
         ConfigItem::OpenClawTools,
         ConfigItem::OpenClawAgents,
-        ConfigItem::WebDavSync,
+        ConfigItem::CloudSync,
         ConfigItem::Reset,
     ];
 
@@ -325,7 +463,7 @@ impl ConfigItem {
                 texts::tui_openclaw_config_agents_title(),
                 Route::ConfigOpenClawAgents,
             ),
-            ConfigItem::WebDavSync => config_item_metadata(texts::tui_config_item_webdav_sync()),
+            ConfigItem::CloudSync => config_item_metadata(texts::tui_config_item_cloud_sync()),
             ConfigItem::Reset => config_item_metadata(texts::tui_config_item_reset()),
         }
     }
@@ -368,25 +506,56 @@ impl ConfigItem {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsItem {
     Language,
+    Theme,
+    Icons,
+    PreferredEditor,
+    VisibleAppsMode,
     VisibleApps,
     MachineLabels,
     OpenClawConfigDir,
+    ManagedAccounts,
     SkipClaudeOnboarding,
     ClaudePluginIntegration,
+    PreserveCodexOfficialAuth,
+    CodexUnifiedSessionHistory,
     Proxy,
+    OutboundProxy,
     CheckForUpdates,
 }
 
 impl SettingsItem {
-    pub const ALL: [SettingsItem; 8] = [
+    pub const ALL: [SettingsItem; 16] = [
+        SettingsItem::ManagedAccounts,
         SettingsItem::Language,
+        SettingsItem::Theme,
+        SettingsItem::Icons,
+        SettingsItem::PreferredEditor,
+        SettingsItem::VisibleAppsMode,
         SettingsItem::VisibleApps,
         SettingsItem::MachineLabels,
         SettingsItem::OpenClawConfigDir,
         SettingsItem::SkipClaudeOnboarding,
         SettingsItem::ClaudePluginIntegration,
+        SettingsItem::PreserveCodexOfficialAuth,
+        SettingsItem::CodexUnifiedSessionHistory,
         SettingsItem::Proxy,
+        SettingsItem::OutboundProxy,
         SettingsItem::CheckForUpdates,
+    ];
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlobalOutboundProxySettingsItem {
+    Url,
+    Username,
+    Password,
+}
+
+impl GlobalOutboundProxySettingsItem {
+    pub const ALL: [GlobalOutboundProxySettingsItem; 3] = [
+        GlobalOutboundProxySettingsItem::Url,
+        GlobalOutboundProxySettingsItem::Username,
+        GlobalOutboundProxySettingsItem::Password,
     ];
 }
 
@@ -417,16 +586,82 @@ pub enum WebDavConfigItem {
     CheckConnection,
     Upload,
     Download,
+    EnableDisable,
     Reset,
     JianguoyunQuickSetup,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloudSyncBackend {
+    WebDav,
+    S3Compatible,
+}
+
+impl CloudSyncBackend {
+    pub const ALL: [Self; 2] = [Self::WebDav, Self::S3Compatible];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::WebDav => "WebDAV",
+            Self::S3Compatible => "S3 Compatible",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloudSyncTransferIntent {
+    Upload,
+    Restore,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum S3ConfigItem {
+    Configure,
+    CheckConnection,
+    Upload,
+    Restore,
+    EnableDisable,
+    Reset,
+}
+
+impl S3ConfigItem {
+    pub const ALL: [Self; 6] = [
+        Self::Configure,
+        Self::CheckConnection,
+        Self::Upload,
+        Self::Restore,
+        Self::EnableDisable,
+        Self::Reset,
+    ];
+
+    pub(crate) fn label(self, enabled: bool) -> &'static str {
+        match self {
+            Self::Configure => texts::tui_config_item_s3_configure(),
+            Self::CheckConnection => texts::tui_config_item_s3_check_connection(),
+            Self::Upload => texts::tui_config_item_s3_upload(),
+            Self::Restore => texts::tui_config_item_s3_restore(),
+            Self::EnableDisable if enabled => texts::tui_config_item_s3_disable(),
+            Self::EnableDisable => texts::tui_config_item_s3_enable(),
+            Self::Reset => texts::tui_config_item_s3_reset(),
+        }
+    }
+
+    pub(crate) fn available(self, configured: bool, enabled: bool) -> bool {
+        match self {
+            Self::Configure => true,
+            Self::CheckConnection | Self::EnableDisable | Self::Reset => configured,
+            Self::Upload | Self::Restore => configured && enabled,
+        }
+    }
+}
+
 impl WebDavConfigItem {
-    pub const ALL: [WebDavConfigItem; 6] = [
+    pub const ALL: [WebDavConfigItem; 7] = [
         WebDavConfigItem::Settings,
         WebDavConfigItem::CheckConnection,
         WebDavConfigItem::Upload,
         WebDavConfigItem::Download,
+        WebDavConfigItem::EnableDisable,
         WebDavConfigItem::Reset,
         WebDavConfigItem::JianguoyunQuickSetup,
     ];
@@ -437,10 +672,19 @@ impl WebDavConfigItem {
             WebDavConfigItem::CheckConnection => texts::tui_config_item_webdav_check_connection(),
             WebDavConfigItem::Upload => texts::tui_config_item_webdav_upload(),
             WebDavConfigItem::Download => texts::tui_config_item_webdav_download(),
+            WebDavConfigItem::EnableDisable => texts::tui_config_item_webdav_enable(),
             WebDavConfigItem::Reset => texts::tui_config_item_webdav_reset(),
             WebDavConfigItem::JianguoyunQuickSetup => {
                 texts::tui_config_item_webdav_jianguoyun_quick_setup()
             }
+        }
+    }
+
+    pub(crate) fn available(&self, configured: bool, enabled: bool) -> bool {
+        match self {
+            Self::Settings | Self::JianguoyunQuickSetup => true,
+            Self::CheckConnection | Self::EnableDisable | Self::Reset => configured,
+            Self::Upload | Self::Download => configured && enabled,
         }
     }
 }
@@ -469,6 +713,12 @@ pub struct App {
     pub overlay: Overlay,
     pub toast: Option<Toast>,
     pub should_quit: bool,
+    /// When set, the main loop should fire a SessionsDeepSearch action.
+    pub pending_deep_search: Option<String>,
+    /// A project picker opened before the current base manifest was ready.
+    pub pending_project_catalog: bool,
+    /// Latest picker query waiting for a current project catalog/worker lane.
+    pub pending_project_filter: Option<String>,
     pub last_size: Size,
     pub tick: u64,
     pub proxy_input_activity_samples: Vec<u64>,
@@ -479,10 +729,29 @@ pub struct App {
     pub proxy_visual_transition: Option<ProxyVisualTransition>,
     pub quota_auto_target_key: Option<String>,
     pub quota_last_auto_tick: Option<u64>,
+    /// Tick of the last periodic session-usage sync, seeded on the first check
+    /// so the interval is measured from TUI start rather than firing at once.
+    pub usage_last_auto_sync_tick: Option<u64>,
+    /// Proxy snapshots mark this when the current app persisted new token
+    /// activity. The main loop consumes it on a throttled aggregate refresh.
+    pub usage_proxy_activity_dirty: bool,
+    pub usage_last_proxy_refresh_tick: Option<u64>,
+    /// Tick the currently running session-usage sync round started at, or
+    /// `None` while no round is in flight. Refresh indicators stay numberless
+    /// until a round outlives the escalation threshold; see
+    /// `ui::shared::sync_escalation`.
+    pub usage_sync_round_started_tick: Option<u64>,
+    pub prompt_import_prompted_apps: HashSet<String>,
+    pub common_config_notice_confirmed: bool,
+    pub usage_query_notice_confirmed: bool,
 
     pub local_env_results: Vec<crate::services::local_env_check::ToolCheckResult>,
-    pub local_env_loading: bool,
+    pub local_env_pending: HashSet<crate::services::local_env_check::LocalTool>,
+    pub local_env_generation: u64,
 
+    pub usage: UsageState,
+    pub pricing: PricingState,
+    pub sessions: SessionsState,
     pub provider_idx: usize,
     pub mcp_idx: usize,
     pub prompt_idx: usize,
@@ -490,24 +759,39 @@ pub struct App {
     pub skills_discover_idx: usize,
     pub skills_repo_idx: usize,
     pub skills_unmanaged_idx: usize,
+    pub skill_updates: HashMap<String, crate::services::skill::SkillUpdateInfo>,
     pub skills_discover_results: Vec<crate::services::skill::Skill>,
     pub skills_discover_query: String,
+    pub skills_discover_source: SkillsDiscoverSource,
+    pub skills_discover_loading: bool,
+    pub skills_discover_request_id: u64,
+    pub skills_discover_active_request_id: Option<u64>,
+    pub skills_discover_cache:
+        HashMap<(SkillsDiscoverSource, String), Vec<crate::services::skill::Skill>>,
     pub skills_unmanaged_results: Vec<crate::services::skill::UnmanagedSkill>,
     pub skills_unmanaged_selected: HashSet<String>,
     pub config_idx: usize,
     pub workspace_idx: usize,
     pub daily_memory_idx: usize,
+    pub hermes_memory_idx: usize,
     pub openclaw_tools_form: Option<OpenClawToolsFormState>,
     pub openclaw_agents_form: Option<OpenClawAgentsFormState>,
     pub openclaw_daily_memory_search_query: String,
     pub openclaw_daily_memory_search_results:
         Vec<crate::commands::workspace::DailyMemorySearchResult>,
     pub config_webdav_idx: usize,
+    pub config_cloud_sync_idx: usize,
+    pub config_s3_idx: usize,
     pub webdav_quick_setup_username: Option<String>,
+    #[allow(dead_code)]
     pub language_idx: usize,
     pub settings_idx: usize,
     pub settings_proxy_idx: usize,
-    /// 当前机器的有效标签集缓存（os/arch + 本机手动标签）。
-    /// 用于列表渲染时判断 MCP/Skill 是否在本机生效。启动与编辑标签后刷新。
+    pub settings_outbound_proxy_idx: usize,
+    pub global_outbound_proxy_draft: Option<crate::services::GlobalOutboundProxyConfig>,
+    pub settings_managed_accounts_idx: usize,
+    pub managed_auth_status: Option<crate::services::ManagedAuthStatus>,
+    pub managed_auth_loading: bool,
+    pub managed_auth_login: Option<ManagedAuthLoginState>,
     pub machine_labels: std::collections::BTreeSet<String>,
 }
