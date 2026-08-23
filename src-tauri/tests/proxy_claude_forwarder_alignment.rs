@@ -1,3 +1,5 @@
+#![allow(clippy::await_holding_lock)]
+
 use std::{
     collections::VecDeque,
     env,
@@ -43,6 +45,14 @@ async fn bind_test_listener() -> tokio::net::TcpListener {
     );
 }
 
+fn free_loopback_port() -> u16 {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral port");
+    listener
+        .local_addr()
+        .expect("read ephemeral address")
+        .port()
+}
+
 #[derive(Clone, Default)]
 struct CountingUpstreamState {
     attempts: Arc<AtomicUsize>,
@@ -84,7 +94,6 @@ impl ProxyEnvGuard {
         let saved = proxy_keys
             .into_iter()
             .chain(bypass_keys)
-            .into_iter()
             .map(|key| {
                 let old = env::var(key).ok();
                 if bypass_keys.contains(&key) {
@@ -378,15 +387,23 @@ async fn start_proxy_service(
     db.set_current_provider("claude", &provider.id)
         .expect("set current provider");
 
+    let app_proxy = db
+        .get_proxy_config_for_app("claude")
+        .await
+        .expect("read claude app proxy config");
+    db.set_app_proxy_preferred_port("claude", 0)
+        .expect("update claude app proxy port");
+    db.update_proxy_config_for_app(app_proxy)
+        .await
+        .expect("update claude app proxy config");
+
     let service = ProxyService::new(db);
     let mut config = service.get_config().await.expect("read proxy config");
     config.listen_port = 0;
     service
-        .update_config(&config)
+        .start_with_runtime_config(config)
         .await
-        .expect("update proxy config");
-
-    service.start().await.expect("start proxy service");
+        .expect("start proxy service");
     service
 }
 
@@ -425,15 +442,23 @@ async fn start_proxy_service_with_rectifier_config(
     )
     .expect("store rectifier config");
 
+    let app_proxy = db
+        .get_proxy_config_for_app("claude")
+        .await
+        .expect("read claude app proxy config");
+    db.set_app_proxy_preferred_port("claude", 0)
+        .expect("update claude app proxy port");
+    db.update_proxy_config_for_app(app_proxy)
+        .await
+        .expect("update claude app proxy config");
+
     let service = ProxyService::new(db);
     let mut config = service.get_config().await.expect("read proxy config");
     config.listen_port = 0;
     service
-        .update_config(&config)
+        .start_with_runtime_config(config)
         .await
-        .expect("update proxy config");
-
-    service.start().await.expect("start proxy service");
+        .expect("start proxy service");
     service
 }
 
@@ -554,19 +579,23 @@ async fn proxy_claude_auto_failover_uses_activated_queue_providers() {
         .get_proxy_config_for_app("claude")
         .await
         .expect("read claude app proxy config");
+    app_proxy.enabled = true;
     app_proxy.auto_failover_enabled = true;
+    db.set_app_proxy_preferred_port("claude", 0)
+        .expect("update claude app proxy port");
     db.update_proxy_config_for_app(app_proxy)
         .await
         .expect("enable auto failover");
+    db.set_app_proxy_preferred_port("claude", free_loopback_port())
+        .expect("set claude preferred proxy port");
 
     let service = ProxyService::new(db.clone());
     let mut config = service.get_config().await.expect("read proxy config");
     config.listen_port = 0;
     service
-        .update_config(&config)
+        .start_with_runtime_config(config)
         .await
-        .expect("update proxy config");
-    service.start().await.expect("start proxy service");
+        .expect("start proxy service");
 
     let response = send_claude_request(
         &service,
@@ -687,7 +716,10 @@ async fn proxy_claude_successful_failover_syncs_current_provider_and_status() {
         .get_proxy_config_for_app("claude")
         .await
         .expect("read claude app proxy config");
+    app_proxy.enabled = true;
     app_proxy.auto_failover_enabled = true;
+    db.set_app_proxy_preferred_port("claude", 0)
+        .expect("update claude app proxy port");
     db.update_proxy_config_for_app(app_proxy)
         .await
         .expect("enable auto failover");
@@ -696,10 +728,9 @@ async fn proxy_claude_successful_failover_syncs_current_provider_and_status() {
     let mut config = service.get_config().await.expect("read proxy config");
     config.listen_port = 0;
     service
-        .update_config(&config)
+        .start_with_runtime_config(config)
         .await
-        .expect("update proxy config");
-    service.start().await.expect("start proxy service");
+        .expect("start proxy service");
 
     let response = send_claude_request(
         &service,
@@ -824,8 +855,11 @@ async fn proxy_claude_failed_failover_keeps_state_unsynced() {
         .get_proxy_config_for_app("claude")
         .await
         .expect("read claude app proxy config");
+    app_proxy.enabled = true;
     app_proxy.auto_failover_enabled = true;
     app_proxy.max_retries = 0;
+    db.set_app_proxy_preferred_port("claude", 0)
+        .expect("update claude app proxy port");
     db.update_proxy_config_for_app(app_proxy)
         .await
         .expect("enable auto failover");
@@ -834,10 +868,9 @@ async fn proxy_claude_failed_failover_keeps_state_unsynced() {
     let mut config = service.get_config().await.expect("read proxy config");
     config.listen_port = 0;
     service
-        .update_config(&config)
+        .start_with_runtime_config(config)
         .await
-        .expect("update proxy config");
-    service.start().await.expect("start proxy service");
+        .expect("start proxy service");
 
     let response = send_claude_request(
         &service,

@@ -1,31 +1,41 @@
 use super::super::theme;
 use super::super::*;
+use super::action_dialog::{render_action_dialog, ActionDialogSpec};
+use super::frame::{overlay_frame, overlay_frame_at, OverlaySize};
 
-pub(super) fn render_help_overlay(frame: &mut Frame<'_>, content_area: Rect, theme: &theme::Theme) {
-    let area = centered_rect(OVERLAY_LG.0, OVERLAY_LG.1, content_area);
-    frame.render_widget(Clear, area);
-
-    let outer = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Plain)
-        .border_style(overlay_border_style(theme, false))
-        .title(texts::tui_help_title());
-    frame.render_widget(outer.clone(), area);
-    let inner = outer.inner(area);
+pub(super) fn render_help_overlay(
+    frame: &mut Frame<'_>,
+    content_area: Rect,
+    theme: &theme::Theme,
+    help: &crate::cli::tui::help::HelpState,
+) {
+    let content = &help.content;
+    let body = overlay_frame(
+        frame,
+        content_area,
+        theme,
+        &content.title,
+        &[
+            ("↑↓", texts::tui_key_scroll()),
+            ("Esc", texts::tui_key_close()),
+        ],
+        OverlaySize::Percent(OVERLAY_LG.0, OVERLAY_LG.1),
+        overlay_border_style(theme, false),
+    );
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0)])
-        .split(inner);
+        .constraints([Constraint::Length(2), Constraint::Min(0)])
+        .split(body);
 
-    render_key_bar_center(frame, chunks[0], theme, &[("Esc", texts::tui_key_close())]);
-
-    let body_area = inset_top(chunks[1], 1);
-    let lines = texts::tui_help_text()
-        .lines()
-        .map(|s| Line::raw(s.to_string()))
-        .collect::<Vec<_>>();
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), body_area);
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            content.eyebrow.clone(),
+            Style::default().fg(theme.comment),
+        )),
+        chunks[0],
+    );
+    render_scrolling_lines(frame, chunks[1], &content.lines, help.scroll);
 }
 
 pub(super) fn render_confirm_overlay(
@@ -34,65 +44,127 @@ pub(super) fn render_confirm_overlay(
     theme: &theme::Theme,
     confirm: &crate::cli::tui::app::ConfirmOverlay,
 ) {
-    let area = centered_rect_fixed(OVERLAY_FIXED_MD.0, OVERLAY_FIXED_MD.1, content_area);
-    frame.render_widget(Clear, area);
-    let outer = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Plain)
-        .border_style(overlay_border_style(theme, true))
-        .title(confirm.title.clone());
-    frame.render_widget(outer.clone(), area);
-    let inner = outer.inner(area);
+    let keys: &[(&str, &str)] = match &confirm.action {
+        ConfirmAction::EditorSaveBeforeClose | ConfirmAction::FormSaveBeforeClose => &[
+            ("Enter", texts::tui_key_save_and_exit()),
+            ("N", texts::tui_key_exit_without_save()),
+            ("Esc", texts::tui_key_cancel()),
+        ],
+        ConfirmAction::ProviderApiFormatProxyNotice => &[("Enter", texts::tui_key_close())],
+        ConfirmAction::VisibleAppsAutoDetection => &[
+            ("Enter", texts::tui_key_use_auto()),
+            ("Esc", texts::tui_key_keep_current()),
+        ],
+        ConfirmAction::VisibleAppsSwitchToManual { .. } => &[
+            ("Enter", texts::tui_key_switch_to_manual()),
+            ("Esc", texts::tui_key_cancel()),
+        ],
+        ConfirmAction::CommonConfigNotice | ConfirmAction::UsageQueryNotice => {
+            &[("Enter", texts::tui_key_close())]
+        }
+        ConfirmAction::ManagedAuthCancelLogin => &[
+            ("Enter", texts::tui_key_cancel_login()),
+            ("Esc", texts::tui_key_keep_waiting()),
+        ],
+        ConfirmAction::RebuildCodexUsage => &[
+            ("Enter", texts::tui_key_backup_and_rebuild()),
+            ("Esc", texts::tui_key_cancel()),
+        ],
+        _ => &[
+            ("Enter", texts::tui_key_yes()),
+            ("Esc", texts::tui_key_cancel()),
+        ],
+    };
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0)])
-        .split(inner);
-    let body_area = inset_top(chunks[1], 1);
+    let body_area = overlay_frame_at(
+        frame,
+        confirm_overlay_rect(content_area, &confirm.message),
+        theme,
+        &confirm.title,
+        keys,
+        overlay_border_style(theme, true),
+    );
 
-    if matches!(
-        confirm.action,
-        ConfirmAction::EditorSaveBeforeClose | ConfirmAction::FormSaveBeforeClose
-    ) {
-        render_key_bar_center(
-            frame,
-            chunks[0],
-            theme,
-            &[
-                ("Enter", texts::tui_key_save_and_exit()),
-                ("N", texts::tui_key_exit_without_save()),
-                ("Esc", texts::tui_key_cancel()),
-            ],
-        );
-    } else if matches!(confirm.action, ConfirmAction::ProviderApiFormatProxyNotice) {
-        render_key_bar_center(
-            frame,
-            chunks[0],
-            theme,
-            &[
-                ("Enter", texts::tui_key_close()),
-                ("Esc", texts::tui_key_close()),
-            ],
-        );
-    } else {
-        render_key_bar_center(
-            frame,
-            chunks[0],
-            theme,
-            &[
-                ("Enter", texts::tui_key_yes()),
-                ("Esc", texts::tui_key_cancel()),
-            ],
-        );
-    }
-
+    let alignment = message_block_alignment(&confirm.message, body_area.width);
     frame.render_widget(
         Paragraph::new(centered_message_lines(
             &confirm.message,
             body_area.width,
             body_area.height,
         ))
-        .alignment(Alignment::Center),
+        .alignment(alignment),
+        body_area,
+    );
+}
+
+pub(super) fn render_codex_history_confirm_overlay(
+    frame: &mut Frame<'_>,
+    content_area: Rect,
+    theme: &theme::Theme,
+    confirm: &crate::cli::tui::app::CodexHistoryConfirmState,
+) {
+    if let Some(actions) = confirm.enable_action_rows() {
+        render_action_dialog(
+            frame,
+            content_area,
+            theme,
+            ActionDialogSpec {
+                title: confirm.title(),
+                message: confirm.message(),
+                actions: &actions,
+                min_size: (OVERLAY_FIXED_LG.0, OVERLAY_FIXED_MD.1),
+                border: overlay_border_style(theme, true),
+            },
+        );
+        return;
+    }
+
+    let checkbox = confirm.restore_checkbox_label().map(|label| {
+        format!(
+            "[{}] {label}",
+            if confirm.restore_checked { "x" } else { " " }
+        )
+    });
+    let display = if let Some(checkbox) = checkbox.as_ref() {
+        format!("{}\n\n{checkbox}", confirm.message())
+    } else {
+        confirm.message().to_string()
+    };
+    let keys: &[(&str, &str)] = if checkbox.is_some() {
+        &[
+            ("Space", texts::tui_key_toggle()),
+            (
+                "Enter",
+                texts::codex_unified_history_disable_confirm_label(),
+            ),
+            ("Esc", texts::tui_key_cancel()),
+        ]
+    } else {
+        &[
+            (
+                "Enter",
+                texts::codex_unified_history_disable_confirm_label(),
+            ),
+            ("Esc", texts::tui_key_cancel()),
+        ]
+    };
+
+    let body_area = overlay_frame_at(
+        frame,
+        confirm_overlay_rect(content_area, &display),
+        theme,
+        confirm.title(),
+        keys,
+        overlay_border_style(theme, true),
+    );
+    let alignment = message_block_alignment(&display, body_area.width);
+    frame.render_widget(
+        Paragraph::new(centered_message_lines(
+            &display,
+            body_area.width,
+            body_area.height,
+        ))
+        .alignment(alignment),
         body_area,
     );
 }
@@ -103,69 +175,48 @@ pub(super) fn render_text_input_overlay(
     theme: &theme::Theme,
     input: &crate::cli::tui::app::TextInputState,
 ) {
-    let area = centered_rect_fixed(OVERLAY_FIXED_LG.0, 12, content_area);
-    frame.render_widget(Clear, area);
-
-    let outer = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Plain)
-        .border_style(overlay_border_style(theme, false))
-        .title(input.title.clone())
-        .style(if theme.no_color {
-            Style::default()
-        } else {
-            Style::default().bg(Color::Black)
-        });
-
-    frame.render_widget(outer.clone(), area);
-    let inner = outer.inner(area);
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Length(2),
-            Constraint::Length(3),
-            Constraint::Min(0),
-        ])
-        .split(inner);
-
-    render_key_bar_center(
+    let body = overlay_frame(
         frame,
-        chunks[0],
+        content_area,
         theme,
+        &input.title,
         &[
             ("Enter", texts::tui_key_submit()),
             ("Esc", texts::tui_key_cancel()),
         ],
+        OverlaySize::Fixed(OVERLAY_FIXED_LG.0, 12),
+        overlay_border_style(theme, false),
     );
 
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(3),
+            Constraint::Min(0),
+        ])
+        .split(body);
+
+    let prompt_lines = input
+        .prompt
+        .lines()
+        .map(|line| Line::raw(line.to_string()))
+        .chain(std::iter::once(Line::raw("")))
+        .collect::<Vec<_>>();
     frame.render_widget(
-        Paragraph::new(vec![Line::raw(input.prompt.clone()), Line::raw("")])
-            .wrap(Wrap { trim: false }),
-        chunks[1],
+        Paragraph::new(prompt_lines).wrap(Wrap { trim: false }),
+        chunks[0],
     );
 
     let input_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(theme.accent))
-        .title(texts::tui_input_title())
-        .style(if theme.no_color {
-            Style::default()
-        } else {
-            Style::default().bg(Color::Black)
-        });
-    let input_inner = input_block.inner(chunks[2]);
-    frame.render_widget(input_block, chunks[2]);
+        .title(format!(" {} ", texts::tui_input_title()));
+    let input_inner = input_block.inner(chunks[1]);
+    frame.render_widget(input_block, chunks[1]);
 
-    let available = input_inner.width as usize;
-    let full = if input.secret {
-        "•".repeat(input.input.value.chars().count())
-    } else {
-        input.input.value.clone()
-    };
-    let cursor = input.input.cursor.min(full.chars().count());
-    let (visible, cursor_x) = visible_text_window(&full, cursor, available);
+    let (visible, cursor_x) = inline_input_window(&input.input, input_inner.width);
     frame.render_widget(
         Paragraph::new(Line::from(Span::raw(visible)))
             .wrap(Wrap { trim: false })
@@ -185,33 +236,19 @@ pub(super) fn render_backup_picker_overlay(
     theme: &theme::Theme,
     selected: usize,
 ) {
-    let area = centered_rect(OVERLAY_LG.0, OVERLAY_LG.1, content_area);
-    frame.render_widget(Clear, area);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Plain)
-        .border_style(overlay_border_style(theme, false))
-        .title(texts::tui_backup_picker_title());
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0)])
-        .split(inner);
-
-    render_key_bar_center(
+    let body = overlay_frame(
         frame,
-        chunks[0],
+        content_area,
         theme,
+        texts::tui_backup_picker_title(),
         &[
             ("Enter", texts::tui_key_restore()),
             ("Esc", texts::tui_key_cancel()),
         ],
+        OverlaySize::Percent(OVERLAY_LG.0, OVERLAY_LG.1),
+        overlay_border_style(theme, false),
     );
 
-    let body_area = inset_top(chunks[1], 1);
     let items = data.config.backups.iter().map(|backup| {
         ListItem::new(Line::from(Span::raw(format!(
             "{}  ({})",
@@ -225,7 +262,7 @@ pub(super) fn render_backup_picker_overlay(
 
     let mut state = ListState::default();
     state.select(Some(selected));
-    frame.render_stateful_widget(list, body_area, &mut state);
+    frame.render_stateful_widget(list, body, &mut state);
 }
 
 pub(super) fn render_text_view_overlay(
@@ -237,31 +274,22 @@ pub(super) fn render_text_view_overlay(
     scroll: usize,
     has_action: bool,
 ) {
-    let area = centered_rect(OVERLAY_LG.0, OVERLAY_LG.1, content_area);
-    frame.render_widget(Clear, area);
-
-    let outer = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Plain)
-        .border_style(overlay_border_style(theme, false))
-        .title(title.to_string());
-    frame.render_widget(outer.clone(), area);
-    let inner = outer.inner(area);
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0)])
-        .split(inner);
-
     let mut keys = vec![("↑↓", texts::tui_key_scroll())];
     if has_action {
         keys.push(("T", texts::tui_key_toggle()));
     }
     keys.push(("Esc", texts::tui_key_close()));
-    render_key_bar_center(frame, chunks[0], theme, &keys);
 
-    let body_area = inset_top(chunks[1], 1);
-    render_scrolling_lines(frame, body_area, lines, scroll);
+    let body = overlay_frame(
+        frame,
+        content_area,
+        theme,
+        title,
+        &keys,
+        OverlaySize::Percent(OVERLAY_LG.0, OVERLAY_LG.1),
+        overlay_border_style(theme, false),
+    );
+    render_scrolling_lines(frame, body, lines, scroll);
 }
 
 pub(super) fn render_common_snippet_picker_overlay(
@@ -270,36 +298,24 @@ pub(super) fn render_common_snippet_picker_overlay(
     theme: &theme::Theme,
     selected: usize,
 ) {
-    let area = centered_rect(48, 38, content_area);
-    frame.render_widget(Clear, area);
-
-    let outer = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Plain)
-        .border_style(overlay_border_style(theme, false))
-        .title(texts::tui_config_item_common_snippet());
-    frame.render_widget(outer.clone(), area);
-    let inner = outer.inner(area);
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0)])
-        .split(inner);
-
-    render_key_bar_center(
+    let labels = ["Claude", "Codex", "Gemini", "OpenCode"];
+    let body = overlay_frame(
         frame,
-        chunks[0],
+        content_area,
         theme,
+        texts::tui_config_item_common_snippet(),
         &[
             ("↑↓", texts::tui_key_select()),
-            ("Enter", texts::tui_key_view()),
-            ("e", texts::tui_key_edit()),
+            ("Enter", texts::tui_key_edit()),
             ("Esc", texts::tui_key_close()),
         ],
+        OverlaySize::FitRows {
+            width: 48,
+            body_rows: labels.len() as u16,
+        },
+        overlay_border_style(theme, false),
     );
 
-    let body_area = inset_top(chunks[1], 1);
-    let labels = ["Claude", "Codex", "Gemini", "OpenCode"];
     let items = labels
         .iter()
         .map(|label| ListItem::new(Line::from(Span::raw(label.to_string()))));
@@ -310,48 +326,7 @@ pub(super) fn render_common_snippet_picker_overlay(
 
     let mut state = ListState::default();
     state.select(Some(selected));
-    frame.render_stateful_widget(list, body_area, &mut state);
-}
-
-pub(super) fn render_common_snippet_view_overlay(
-    frame: &mut Frame<'_>,
-    content_area: Rect,
-    theme: &theme::Theme,
-    title: &str,
-    lines: &[String],
-    scroll: usize,
-) {
-    let area = centered_rect(OVERLAY_LG.0, OVERLAY_LG.1, content_area);
-    frame.render_widget(Clear, area);
-
-    let outer = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Plain)
-        .border_style(overlay_border_style(theme, false))
-        .title(title.to_string());
-    frame.render_widget(outer.clone(), area);
-    let inner = outer.inner(area);
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0)])
-        .split(inner);
-
-    render_key_bar_center(
-        frame,
-        chunks[0],
-        theme,
-        &[
-            ("a", texts::tui_key_apply()),
-            ("c", texts::tui_key_clear()),
-            ("e", texts::tui_key_edit()),
-            ("↑↓", texts::tui_key_scroll()),
-            ("Esc", texts::tui_key_close()),
-        ],
-    );
-
-    let body_area = inset_top(chunks[1], 1);
-    render_scrolling_lines(frame, body_area, lines, scroll);
+    frame.render_stateful_widget(list, body, &mut state);
 }
 
 fn render_scrolling_lines(frame: &mut Frame<'_>, area: Rect, lines: &[String], scroll: usize) {

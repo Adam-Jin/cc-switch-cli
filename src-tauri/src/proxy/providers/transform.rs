@@ -1,4 +1,11 @@
-use crate::proxy::error::ProxyError;
+use crate::proxy::{
+    error::ProxyError,
+    json_canonical::canonical_json_string,
+    tool_media::{
+        chat_media_part_from_tool_part, flush_pending_chat_tool_media, plan_chat_tool_output_media,
+        queue_chat_tool_output_media, ToolMediaScope,
+    },
+};
 use serde_json::{json, Value};
 use std::borrow::Cow;
 
@@ -50,31 +57,45 @@ pub fn resolve_reasoning_effort(body: &Value) -> Option<&'static str> {
     }
 }
 
-pub fn sanitize_system_text(text: &str) -> Option<Cow<'_, str>> {
-    let mut sanitized = String::new();
-    let mut removed = false;
-
-    for segment in text.split_inclusive('\n') {
-        let line = segment.strip_suffix('\n').unwrap_or(segment);
-        if line
-            .trim_start()
-            .starts_with(ANTHROPIC_BILLING_HEADER_PREFIX)
-        {
-            removed = true;
-            continue;
-        }
-        sanitized.push_str(segment);
+pub(crate) fn strip_leading_anthropic_billing_header(text: &str) -> &str {
+    if !text.starts_with(ANTHROPIC_BILLING_HEADER_PREFIX) {
+        return text;
     }
 
-    if !removed {
-        return Some(Cow::Borrowed(text));
+    let Some(line_end) = text
+        .as_bytes()
+        .iter()
+        .position(|byte| *byte == b'\n' || *byte == b'\r')
+    else {
+        return "";
+    };
+
+    let bytes = text.as_bytes();
+    let mut rest_start = line_end + 1;
+    if bytes[line_end] == b'\r' && bytes.get(line_end + 1) == Some(&b'\n') {
+        rest_start += 1;
     }
 
-    if sanitized.is_empty() {
-        None
+    let rest = &text[rest_start..];
+    if let Some(stripped) = rest.strip_prefix("\r\n") {
+        stripped
+    } else if let Some(stripped) = rest.strip_prefix('\n') {
+        stripped
+    } else if let Some(stripped) = rest.strip_prefix('\r') {
+        stripped
     } else {
-        Some(Cow::Owned(sanitized))
+        rest
     }
+}
+
+pub fn sanitize_system_text(text: &str) -> Option<Cow<'_, str>> {
+    let text = strip_leading_anthropic_billing_header(text);
+
+    if text.is_empty() {
+        return None;
+    }
+
+    Some(Cow::Borrowed(text))
 }
 
 pub fn anthropic_to_openai(body: Value, cache_key: Option<&str>) -> Result<Value, ProxyError> {
@@ -105,10 +126,7 @@ pub fn anthropic_to_openai_with_reasoning_content(
                     let Some(text) = sanitize_system_text(text) else {
                         continue;
                     };
-                    let mut system_message = json!({"role": "system", "content": text});
-                    if let Some(cache_control) = msg.get("cache_control") {
-                        system_message["cache_control"] = cache_control.clone();
-                    }
+                    let system_message = json!({"role": "system", "content": text});
                     messages.push(system_message);
                 }
             }
@@ -162,18 +180,14 @@ pub fn anthropic_to_openai_with_reasoning_content(
             .iter()
             .filter(|t| t.get("type").and_then(|v| v.as_str()) != Some("BatchTool"))
             .map(|t| {
-                let mut tool = json!({
+                json!({
                     "type": "function",
                     "function": {
                         "name": t.get("name").and_then(|n| n.as_str()).unwrap_or(""),
                         "description": t.get("description"),
                         "parameters": clean_schema(t.get("input_schema").cloned().unwrap_or(json!({})))
                     }
-                });
-                if let Some(cache_control) = t.get("cache_control") {
-                    tool["cache_control"] = cache_control.clone();
-                }
-                tool
+                })
             })
             .collect();
 
@@ -183,7 +197,7 @@ pub fn anthropic_to_openai_with_reasoning_content(
     }
 
     if let Some(v) = body.get("tool_choice") {
-        result["tool_choice"] = v.clone();
+        result["tool_choice"] = map_tool_choice_to_chat(v);
     }
 
     if let Some(key) = cache_key {
@@ -191,6 +205,59 @@ pub fn anthropic_to_openai_with_reasoning_content(
     }
 
     Ok(result)
+}
+
+/// Inject `stream_options.include_usage` into an OpenAI Chat Completions request.
+///
+/// OpenAI-compatible upstreams do not emit usage in the SSE stream unless the
+/// request explicitly sets `stream_options.include_usage = true`; without it the
+/// converted Anthropic `message_delta` reports all-zero tokens (input/output/cache),
+/// so streamed requests silently lose their token/cost/cache accounting (see #323).
+/// Existing `stream_options` fields the client passed through are preserved; only
+/// `include_usage` is added, and non-streaming requests are left untouched.
+pub(crate) fn inject_openai_stream_include_usage(result: &mut Value) {
+    let is_stream = result
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !is_stream {
+        return;
+    }
+    match result.get_mut("stream_options") {
+        Some(Value::Object(opts)) => {
+            opts.insert("include_usage".to_string(), json!(true));
+        }
+        _ => {
+            result["stream_options"] = json!({ "include_usage": true });
+        }
+    }
+}
+
+/// Translate Anthropic tool_choice into OpenAI Chat Completions format.
+fn map_tool_choice_to_chat(tool_choice: &Value) -> Value {
+    match tool_choice {
+        Value::String(value) => match value.as_str() {
+            "any" => json!("required"),
+            _ => json!(value),
+        },
+        Value::Object(obj) => match obj.get("type").and_then(|value| value.as_str()) {
+            Some("any") => json!("required"),
+            Some("auto") => json!("auto"),
+            Some("none") => json!("none"),
+            Some("tool") => {
+                let name = obj
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                json!({
+                    "type": "function",
+                    "function": { "name": name }
+                })
+            }
+            _ => tool_choice.clone(),
+        },
+        _ => tool_choice.clone(),
+    }
 }
 
 fn normalize_openai_system_messages(messages: &mut Vec<Value>) {
@@ -240,7 +307,8 @@ fn normalize_openai_system_messages(messages: &mut Vec<Value>) {
     });
 
     if !parts.is_empty() {
-        messages.insert(0, json!({"role": "system", "content": parts.join("\n")}));
+        let merged = json!({"role": "system", "content": parts.join("\n")});
+        messages.insert(0, merged);
     }
 }
 
@@ -267,6 +335,7 @@ fn convert_message_to_openai(
     if let Some(blocks) = content.as_array() {
         let mut content_parts = Vec::new();
         let mut tool_calls = Vec::new();
+        let mut pending_tool_media = Vec::new();
         let mut reasoning_parts = Vec::new();
 
         for block in blocks {
@@ -274,24 +343,14 @@ fn convert_message_to_openai(
             match block_type {
                 "text" => {
                     if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                        let mut part = json!({"type": "text", "text": text});
-                        if let Some(cache_control) = block.get("cache_control") {
-                            part["cache_control"] = cache_control.clone();
-                        }
-                        content_parts.push(part);
+                        content_parts.push(json!({"type": "text", "text": text}));
                     }
                 }
                 "image" => {
-                    if let Some(source) = block.get("source") {
-                        let media_type = source
-                            .get("media_type")
-                            .and_then(|m| m.as_str())
-                            .unwrap_or("image/png");
-                        let data = source.get("data").and_then(|d| d.as_str()).unwrap_or("");
-                        content_parts.push(json!({
-                            "type": "image_url",
-                            "image_url": {"url": format!("data:{};base64,{}", media_type, data)}
-                        }));
+                    if let Some(image) =
+                        chat_media_part_from_tool_part(block, ToolMediaScope::ImagesOnly)
+                    {
+                        content_parts.push(image);
                     }
                 }
                 "tool_use" => {
@@ -303,7 +362,7 @@ fn convert_message_to_openai(
                         "type": "function",
                         "function": {
                             "name": name,
-                            "arguments": serde_json::to_string(&input).unwrap_or_default()
+                            "arguments": canonical_json_string(&input)
                         }
                     }));
                 }
@@ -313,10 +372,22 @@ fn convert_message_to_openai(
                         .and_then(|i| i.as_str())
                         .unwrap_or("");
                     let content_val = block.get("content");
-                    let content_str = match content_val {
-                        Some(Value::String(s)) => s.clone(),
-                        Some(v) => serde_json::to_string(v).unwrap_or_default(),
-                        None => String::new(),
+                    let media_plan = content_val.cloned().and_then(plan_chat_tool_output_media);
+                    let content_str = if let Some(media_plan) = media_plan {
+                        queue_chat_tool_output_media(
+                            &mut pending_tool_media,
+                            tool_use_id,
+                            media_plan.media_parts,
+                        );
+                        media_plan.tool_content
+                    } else {
+                        // Keep the no-media representation exactly equal to
+                        // the legacy converter for prompt-cache stability.
+                        match content_val {
+                            Some(Value::String(s)) => s.clone(),
+                            Some(v) => canonical_json_string(v),
+                            None => String::new(),
+                        }
                     };
                     result.push(json!({
                         "role": "tool",
@@ -331,18 +402,24 @@ fn convert_message_to_openai(
                         }
                     }
                 }
+                "redacted_thinking" if preserve_reasoning_content => {
+                    reasoning_parts.push("[redacted thinking]".to_string());
+                }
                 _ => {}
             }
         }
+
+        // Chat tool messages cannot carry image parts. Keep parallel tool
+        // results adjacent, then present all extracted media in one user turn
+        // before any ordinary message content from the same Anthropic turn.
+        flush_pending_chat_tool_media(&mut result, &mut pending_tool_media);
 
         if !content_parts.is_empty() || !tool_calls.is_empty() {
             let mut msg = json!({"role": role});
             if content_parts.is_empty() {
                 msg["content"] = Value::Null;
             } else if content_parts.len() == 1 {
-                if content_parts[0].get("cache_control").is_some() {
-                    msg["content"] = json!(content_parts);
-                } else if let Some(text) = content_parts[0].get("text") {
+                if let Some(text) = content_parts[0].get("text") {
                     msg["content"] = text.clone();
                 } else {
                     msg["content"] = json!(content_parts);
@@ -374,23 +451,91 @@ fn convert_message_to_openai(
     Ok(result)
 }
 
-pub(crate) fn clean_schema(mut schema: Value) -> Value {
+pub(crate) fn clean_schema(schema: Value) -> Value {
+    clean_schema_inner(schema, true)
+}
+
+fn clean_schema_inner(mut schema: Value, is_root: bool) -> Value {
     if let Some(obj) = schema.as_object_mut() {
+        let missing_type = is_root && !obj.contains_key("type");
+        if missing_type {
+            obj.insert("type".to_string(), json!("object"));
+        }
+        if missing_type && !obj.contains_key("properties") {
+            obj.insert("properties".to_string(), json!({}));
+        }
+
         if obj.get("format").and_then(|v| v.as_str()) == Some("uri") {
             obj.remove("format");
         }
 
         if let Some(properties) = obj.get_mut("properties").and_then(|v| v.as_object_mut()) {
             for (_, value) in properties.iter_mut() {
-                *value = clean_schema(value.clone());
+                *value = clean_schema_inner(value.clone(), false);
             }
         }
 
         if let Some(items) = obj.get_mut("items") {
-            *items = clean_schema(items.clone());
+            *items = clean_schema_inner(items.clone(), false);
         }
     }
     schema
+}
+
+/// Map an OpenAI-compatible `usage` object onto Anthropic usage fields.
+///
+/// OpenAI `prompt_tokens` is inclusive of cache hits, but Anthropic `input_tokens`
+/// is fresh input only. This path is billed as app_type="claude" (the cost calculator
+/// does NOT subtract cache again), so `cache_read` + `cache_creation` must be subtracted
+/// here — otherwise cached tokens would be counted both as input and in the cache buckets.
+/// The three buckets are mutually exclusive: input + cache_read + cache_creation ==
+/// prompt_tokens. Symmetric with the streaming path's `build_stream_usage_json`.
+fn openai_usage_to_anthropic(body: &Value) -> Value {
+    let usage = body.get("usage").cloned().unwrap_or(json!({}));
+    // Direct `cache_read_input_tokens` field takes priority over nested cached_tokens.
+    let cached = usage
+        .get("cache_read_input_tokens")
+        .and_then(|v| v.as_u64())
+        .or_else(|| {
+            usage
+                .pointer("/prompt_tokens_details/cached_tokens")
+                .and_then(|v| v.as_u64())
+        })
+        .unwrap_or(0);
+    let cache_creation = usage
+        .get("cache_creation_input_tokens")
+        .and_then(|v| v.as_u64())
+        .or_else(|| {
+            usage
+                .pointer("/prompt_tokens_details/cache_write_tokens")
+                .or_else(|| usage.pointer("/input_tokens_details/cache_write_tokens"))
+                .and_then(|v| v.as_u64())
+        })
+        .unwrap_or(0);
+    let input_tokens = usage
+        .get("prompt_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+        .saturating_sub(cached)
+        .saturating_sub(cache_creation) as u32;
+    let output_tokens = usage
+        .get("completion_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+
+    let mut usage_json = json!({
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens
+    });
+
+    if cached > 0 {
+        usage_json["cache_read_input_tokens"] = json!(cached);
+    }
+    if cache_creation > 0 {
+        usage_json["cache_creation_input_tokens"] = json!(cache_creation);
+    }
+
+    usage_json
 }
 
 pub fn openai_to_anthropic(body: Value) -> Result<Value, ProxyError> {
@@ -398,6 +543,30 @@ pub fn openai_to_anthropic(body: Value) -> Result<Value, ProxyError> {
         .get("choices")
         .and_then(|c| c.as_array())
         .ok_or_else(|| ProxyError::TransformError("No choices in response".to_string()))?;
+
+    // Some upstreams (e.g. NVIDIA NIM's z-ai/glm-5.2) intermittently return a valid
+    // JSON body whose `choices` is an empty array alongside a usage-only payload:
+    //   {"id":"...","choices":[],"usage":{...}}
+    // Treat this as an empty assistant turn instead of failing the whole request with
+    // a 502, mirroring how the streaming path skips usage-only tail chunks. See #325
+    // and the desktop fix for farion1231/cc-switch#3951.
+    //
+    // Guard on the absence of a top-level `error`: an error body that also carries an
+    // empty `choices` array must not be masked as a successful empty turn. It falls
+    // through and is surfaced as a transform failure instead.
+    if choices.is_empty() && body.get("error").is_none() {
+        return Ok(json!({
+            "id": body.get("id").and_then(|i| i.as_str()).unwrap_or(""),
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "model": body.get("model").and_then(|m| m.as_str()).unwrap_or(""),
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "usage": openai_usage_to_anthropic(&body)
+        }));
+    }
+
     let choice = choices
         .first()
         .ok_or_else(|| ProxyError::TransformError("Empty choices array".to_string()))?;
@@ -519,33 +688,7 @@ pub fn openai_to_anthropic(body: Value) -> Result<Value, ProxyError> {
         })
         .or(if has_tool_use { Some("tool_use") } else { None });
 
-    let usage = body.get("usage").cloned().unwrap_or(json!({}));
-    let input_tokens = usage
-        .get("prompt_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u32;
-    let output_tokens = usage
-        .get("completion_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u32;
-
-    let mut usage_json = json!({
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens
-    });
-
-    if let Some(cached) = usage
-        .pointer("/prompt_tokens_details/cached_tokens")
-        .and_then(|v| v.as_u64())
-    {
-        usage_json["cache_read_input_tokens"] = json!(cached);
-    }
-    if let Some(v) = usage.get("cache_read_input_tokens") {
-        usage_json["cache_read_input_tokens"] = v.clone();
-    }
-    if let Some(v) = usage.get("cache_creation_input_tokens") {
-        usage_json["cache_creation_input_tokens"] = v.clone();
-    }
+    let usage_json = openai_usage_to_anthropic(&body);
 
     Ok(json!({
         "id": body.get("id").and_then(|i| i.as_str()).unwrap_or(""),
@@ -562,6 +705,28 @@ pub fn openai_to_anthropic(body: Value) -> Result<Value, ProxyError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inject_include_usage_preserves_existing_stream_options() {
+        let mut body = json!({
+            "stream": true,
+            "stream_options": { "continuous_usage_stats": true }
+        });
+        inject_openai_stream_include_usage(&mut body);
+        assert_eq!(body["stream_options"]["include_usage"], true);
+        assert_eq!(body["stream_options"]["continuous_usage_stats"], true);
+    }
+
+    #[test]
+    fn inject_include_usage_noop_for_non_stream() {
+        let mut body = json!({ "stream": false });
+        inject_openai_stream_include_usage(&mut body);
+        assert!(body.get("stream_options").is_none());
+
+        let mut body = json!({ "messages": [] });
+        inject_openai_stream_include_usage(&mut body);
+        assert!(body.get("stream_options").is_none());
+    }
 
     #[test]
     fn anthropic_to_openai_removes_billing_header_from_system_string() {
@@ -591,7 +756,7 @@ mod tests {
         let result = anthropic_to_openai(input, None).unwrap();
 
         assert_eq!(result["messages"][0]["content"], "Project instructions");
-        assert_eq!(result["messages"][0]["cache_control"]["type"], "ephemeral");
+        assert!(result["messages"][0].get("cache_control").is_none());
     }
 
     #[test]
@@ -611,12 +776,21 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_system_text_preserves_remaining_content() {
+    fn sanitize_system_text_keeps_non_leading_billing_header_text() {
         let text = "First line\n  x-anthropic-billing-header: cc_version=2.1.120.cf9; cc_entrypoint=cli; cch=543cf;\n\nLast line\n";
 
         let result = sanitize_system_text(text).unwrap();
 
-        assert_eq!(result, "First line\n\nLast line\n");
+        assert_eq!(result, text);
+    }
+
+    #[test]
+    fn sanitize_system_text_strips_leading_billing_header_with_crlf() {
+        let text = "x-anthropic-billing-header: cc_version=2.1.120.cf9; cc_entrypoint=cli; cch=543cf;\r\n\r\nYou are helpful.";
+
+        let result = sanitize_system_text(text).unwrap();
+
+        assert_eq!(result, "You are helpful.");
     }
 
     #[test]
@@ -648,11 +822,79 @@ mod tests {
         let result = anthropic_to_openai(input, None).unwrap();
 
         assert_eq!(result["messages"][0]["role"], "system");
-        assert_eq!(result["messages"][0]["cache_control"]["type"], "ephemeral");
+        assert!(result["messages"][0].get("cache_control").is_none());
     }
 
     #[test]
-    fn anthropic_to_openai_preserves_text_block_cache_control_and_array_shape() {
+    fn anthropic_to_openai_preserves_matching_system_cache_control_when_merging() {
+        let input = json!({
+            "model": "claude-3-sonnet",
+            "max_tokens": 1024,
+            "system": [
+                {"type": "text", "text": "You are Claude Code.", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "Be concise.", "cache_control": {"type": "ephemeral"}}
+            ],
+            "messages": [{"role": "user", "content": "Hello"}]
+        });
+
+        let result = anthropic_to_openai(input, None).unwrap();
+
+        assert_eq!(result["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(result["messages"][0]["role"], "system");
+        assert_eq!(
+            result["messages"][0]["content"],
+            "You are Claude Code.\nBe concise."
+        );
+        assert!(result["messages"][0].get("cache_control").is_none());
+        assert_eq!(result["messages"][1]["role"], "user");
+    }
+
+    #[test]
+    fn anthropic_to_openai_drops_mixed_present_absent_system_cache_control_when_merging() {
+        let input = json!({
+            "model": "claude-3-sonnet",
+            "max_tokens": 1024,
+            "system": [
+                {"type": "text", "text": "You are Claude Code.", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "Be concise."}
+            ],
+            "messages": [{"role": "user", "content": "Hello"}]
+        });
+
+        let result = anthropic_to_openai(input, None).unwrap();
+
+        assert_eq!(result["messages"][0]["role"], "system");
+        assert_eq!(
+            result["messages"][0]["content"],
+            "You are Claude Code.\nBe concise."
+        );
+        assert!(result["messages"][0].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn anthropic_to_openai_drops_conflicting_system_cache_control_when_merging() {
+        let input = json!({
+            "model": "claude-3-sonnet",
+            "max_tokens": 1024,
+            "system": [
+                {"type": "text", "text": "You are Claude Code.", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "Be concise.", "cache_control": {"type": "ephemeral", "ttl": "5m"}}
+            ],
+            "messages": [{"role": "user", "content": "Hello"}]
+        });
+
+        let result = anthropic_to_openai(input, None).unwrap();
+
+        assert_eq!(result["messages"][0]["role"], "system");
+        assert_eq!(
+            result["messages"][0]["content"],
+            "You are Claude Code.\nBe concise."
+        );
+        assert!(result["messages"][0].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn anthropic_to_openai_strips_text_block_cache_control_and_simplifies_single_block() {
         let input = json!({
             "model": "claude-3-opus",
             "max_tokens": 1024,
@@ -668,15 +910,7 @@ mod tests {
 
         let result = anthropic_to_openai(input, None).unwrap();
 
-        assert!(result["messages"][0]["content"].is_array());
-        assert_eq!(
-            result["messages"][0]["content"][0]["cache_control"]["type"],
-            "ephemeral"
-        );
-        assert_eq!(
-            result["messages"][0]["content"][0]["cache_control"]["ttl"],
-            "5m"
-        );
+        assert_eq!(result["messages"][0]["content"], "Hello");
     }
 
     #[test]
@@ -695,7 +929,116 @@ mod tests {
 
         let result = anthropic_to_openai(input, None).unwrap();
 
-        assert_eq!(result["tools"][0]["cache_control"]["type"], "ephemeral");
+        assert!(result["tools"][0].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn anthropic_to_openai_defaults_missing_tool_schema_type() {
+        let input = json!({
+            "model": "claude-3-opus",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "What's the weather?"}],
+            "tools": [{
+                "name": "get_weather",
+                "description": "Get weather info",
+                "input_schema": {"properties": {"location": {"type": "string"}}}
+            }]
+        });
+
+        let result = anthropic_to_openai(input, None).unwrap();
+        let parameters = &result["tools"][0]["function"]["parameters"];
+
+        assert_eq!(parameters["type"], json!("object"));
+        assert_eq!(
+            parameters["properties"]["location"]["type"],
+            json!("string")
+        );
+    }
+
+    #[test]
+    fn anthropic_to_openai_defaults_empty_tool_schema() {
+        let input = json!({
+            "model": "claude-3-opus",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "Do work"}],
+            "tools": [{"name": "do_work", "input_schema": {}}]
+        });
+
+        let result = anthropic_to_openai(input, None).unwrap();
+        let parameters = &result["tools"][0]["function"]["parameters"];
+
+        assert_eq!(parameters, &json!({"type": "object", "properties": {}}));
+    }
+
+    #[test]
+    fn clean_schema_only_defaults_root_to_object() {
+        let schema = json!({
+            "properties": {
+                "nullable_value": {
+                    "anyOf": [{"type": "string"}, {"type": "null"}]
+                },
+                "list": {
+                    "items": {"type": "string"}
+                }
+            }
+        });
+
+        let result = clean_schema(schema);
+
+        assert_eq!(result["type"], json!("object"));
+        assert_eq!(
+            result["properties"]["nullable_value"],
+            json!({"anyOf": [{"type": "string"}, {"type": "null"}]})
+        );
+        assert_eq!(
+            result["properties"]["list"],
+            json!({"items": {"type": "string"}})
+        );
+    }
+
+    fn run_tool_choice(value: Value) -> Value {
+        let input = json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "tools": [{
+                "name": "search",
+                "description": "Search",
+                "input_schema": {"type": "object", "properties": {}}
+            }],
+            "tool_choice": value
+        });
+
+        anthropic_to_openai(input, None).unwrap()["tool_choice"].clone()
+    }
+
+    #[test]
+    fn tool_choice_string_any_maps_to_required() {
+        assert_eq!(run_tool_choice(json!("any")), json!("required"));
+    }
+
+    #[test]
+    fn tool_choice_string_auto_and_none_pass_through() {
+        assert_eq!(run_tool_choice(json!("auto")), json!("auto"));
+        assert_eq!(run_tool_choice(json!("none")), json!("none"));
+    }
+
+    #[test]
+    fn tool_choice_object_any_maps_to_required() {
+        assert_eq!(run_tool_choice(json!({"type": "any"})), json!("required"));
+    }
+
+    #[test]
+    fn tool_choice_object_auto_and_none_collapse_to_string() {
+        assert_eq!(run_tool_choice(json!({"type": "auto"})), json!("auto"));
+        assert_eq!(run_tool_choice(json!({"type": "none"})), json!("none"));
+    }
+
+    #[test]
+    fn tool_choice_forced_tool_maps_to_nested_function_selector() {
+        assert_eq!(
+            run_tool_choice(json!({"type": "tool", "name": "search"})),
+            json!({"type": "function", "function": {"name": "search"}})
+        );
     }
 
     #[test]
@@ -785,6 +1128,247 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_to_openai_tool_use_uses_redacted_thinking_placeholder() {
+        let input = json!({
+            "model": "mimo-v2.5-pro",
+            "messages": [{
+                "role": "assistant",
+                "content": [
+                    {"type": "redacted_thinking", "data": "opaque"},
+                    {"type": "tool_use", "id": "call_1", "name": "get_weather", "input": {"city": "Tokyo"}}
+                ]
+            }]
+        });
+
+        let result = anthropic_to_openai_with_reasoning_content(input, None, true).unwrap();
+
+        assert_eq!(
+            result["messages"][0]["reasoning_content"],
+            "[redacted thinking]"
+        );
+        assert_eq!(result["messages"][0]["tool_calls"][0]["id"], "call_1");
+    }
+
+    #[test]
+    fn anthropic_to_openai_tool_use_arguments_are_canonical_json() {
+        let input = json!({
+            "model": "claude-3-opus",
+            "messages": [{
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "call_1",
+                        "name": "lookup",
+                        "input": {
+                            "z": 1,
+                            "a": {
+                                "b": 2,
+                                "a": 1
+                            }
+                        }
+                    }
+                ]
+            }]
+        });
+
+        let result = anthropic_to_openai(input, None).unwrap();
+
+        assert_eq!(
+            result["messages"][0]["tool_calls"][0]["function"]["arguments"],
+            r#"{"a":{"a":1,"b":2},"z":1}"#
+        );
+    }
+
+    #[test]
+    fn anthropic_to_openai_tool_result_content_is_canonical_json() {
+        let input = json!({
+            "model": "claude-3-opus",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "call_1",
+                    "content": {
+                        "z": 1,
+                        "a": {
+                            "b": 2,
+                            "a": 1
+                        }
+                    }
+                }]
+            }]
+        });
+
+        let result = anthropic_to_openai(input, None).unwrap();
+
+        assert_eq!(result["messages"][0]["role"], "tool");
+        assert_eq!(result["messages"][0]["tool_call_id"], "call_1");
+        assert_eq!(
+            result["messages"][0]["content"],
+            r#"{"a":{"a":1,"b":2},"z":1}"#
+        );
+    }
+
+    #[test]
+    fn anthropic_to_openai_no_media_tool_results_keep_legacy_representation() {
+        let raw_json_string = "{ \"status\": \"ok\", \"count\": 2 }";
+        let input = json!({
+            "model": "claude-3-opus",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call_string",
+                        "content": raw_json_string
+                    },
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call_array",
+                        "content": [{"type": "text", "text": "plain"}]
+                    }
+                ]
+            }]
+        });
+
+        let result = anthropic_to_openai(input, None).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["content"], raw_json_string);
+        assert_eq!(
+            messages[1]["content"],
+            canonical_json_string(&json!([{"type": "text", "text": "plain"}]))
+        );
+    }
+
+    #[test]
+    fn anthropic_to_openai_moves_tool_result_image_to_user_message() {
+        let input = json!({
+            "model": "claude-3-opus",
+            "max_tokens": 1024,
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "call_image",
+                    "content": [
+                        {"type": "text", "text": "caption"},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": "CLAUDE_CHAT_IMAGE_SENTINEL"
+                            },
+                            "cache_control": {"type": "ephemeral"},
+                            "prompt_cache_breakpoint": true
+                        }
+                    ]
+                }]
+            }]
+        });
+
+        let result = anthropic_to_openai(input, None).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "tool");
+        assert_eq!(messages[0]["tool_call_id"], "call_image");
+        assert!(messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("tool result media moved"));
+        assert!(!messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("CLAUDE_CHAT_IMAGE_SENTINEL"));
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(
+            messages[1]["content"][0]["text"],
+            "[cc-switch: media output of tool call call_image]"
+        );
+        assert_eq!(messages[1]["content"][1]["type"], "image_url");
+        assert!(messages[1]["content"][1].get("cache_control").is_none());
+        assert!(messages[1]["content"][1]
+            .get("prompt_cache_breakpoint")
+            .is_none());
+        assert_eq!(
+            messages[1]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,CLAUDE_CHAT_IMAGE_SENTINEL"
+        );
+    }
+
+    #[test]
+    fn anthropic_to_openai_batches_parallel_tool_result_media() {
+        let input = json!({
+            "model": "claude-3-opus",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call_1",
+                        "content": [{
+                            "type": "image",
+                            "source": {"type": "base64", "media_type": "image/png", "data": "ONE"}
+                        }]
+                    },
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call_2",
+                        "content": [{
+                            "type": "image",
+                            "source": {"type": "base64", "media_type": "image/jpeg", "data": "TWO"}
+                        }]
+                    }
+                ]
+            }]
+        });
+
+        let result = anthropic_to_openai(input, None).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["role"], "tool");
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[2]["content"].as_array().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn anthropic_to_openai_maps_remote_image_source() {
+        let input = json!({
+            "model": "claude-3-opus",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "image",
+                    "source": {
+                        "type": "url",
+                        "url": "https://example.com/image.png"
+                    },
+                    "cache_control": {"type": "ephemeral"},
+                    "prompt_cache_breakpoint": true
+                }]
+            }]
+        });
+
+        let result = anthropic_to_openai(input, None).unwrap();
+        assert_eq!(
+            result["messages"][0]["content"][0]["image_url"]["url"],
+            "https://example.com/image.png"
+        );
+        assert!(result["messages"][0]["content"][0]
+            .get("cache_control")
+            .is_none());
+        assert!(result["messages"][0]["content"][0]
+            .get("prompt_cache_breakpoint")
+            .is_none());
+    }
+
+    #[test]
     fn openai_to_anthropic_maps_reasoning_content_to_thinking_block() {
         let input = json!({
             "id": "chatcmpl-deepseek",
@@ -814,6 +1398,60 @@ mod tests {
         );
         assert_eq!(result["content"][1]["type"], "text");
         assert_eq!(result["content"][2]["type"], "tool_use");
+    }
+
+    #[test]
+    fn openai_to_anthropic_treats_empty_choices_as_empty_turn() {
+        // NVIDIA NIM's z-ai/glm-5.2 intermittently returns a usage-only body with an
+        // empty `choices` array. It must map to a valid empty message, not a 502. (#325)
+        let input = json!({
+            "id": "chatcmpl-nvidia",
+            "model": "z-ai/glm-5.2",
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 13312,
+                "completion_tokens": 79,
+                "prompt_tokens_details": {
+                    "cached_tokens": 100,
+                    "cache_write_tokens": 200
+                }
+            }
+        });
+
+        let result = openai_to_anthropic(input).unwrap();
+
+        assert_eq!(result["type"], "message");
+        assert_eq!(result["role"], "assistant");
+        assert_eq!(result["id"], "chatcmpl-nvidia");
+        assert_eq!(result["model"], "z-ai/glm-5.2");
+        assert_eq!(result["stop_reason"], "end_turn");
+        assert_eq!(result["content"], json!([]));
+        // Fresh input = prompt_tokens - cache read - cache write.
+        assert_eq!(result["usage"]["input_tokens"], 13012);
+        assert_eq!(result["usage"]["output_tokens"], 79);
+        assert_eq!(result["usage"]["cache_read_input_tokens"], 100);
+        assert_eq!(result["usage"]["cache_creation_input_tokens"], 200);
+    }
+
+    #[test]
+    fn openai_to_anthropic_still_errors_when_choices_field_missing() {
+        // A body with no `choices` field at all is genuinely malformed and should
+        // still be rejected, unlike an explicitly empty array.
+        let input = json!({"id": "chatcmpl-bad", "usage": {}});
+        let err = openai_to_anthropic(input).unwrap_err();
+        assert!(matches!(err, ProxyError::TransformError(_)));
+    }
+
+    #[test]
+    fn openai_to_anthropic_does_not_mask_error_body_with_empty_choices() {
+        // An error payload that also carries an empty `choices` array must not be
+        // silently converted into a successful empty turn.
+        let input = json!({
+            "choices": [],
+            "error": {"message": "upstream exploded", "type": "server_error"}
+        });
+        let err = openai_to_anthropic(input).unwrap_err();
+        assert!(matches!(err, ProxyError::TransformError(_)));
     }
 
     #[test]

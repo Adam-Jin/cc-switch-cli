@@ -151,15 +151,16 @@ async fn assert_forwarded_model(case: MappingCase) {
     db.set_current_provider("claude", &provider.id)
         .expect("set current provider");
 
+    db.set_app_proxy_preferred_port("claude", 0)
+        .expect("update claude app proxy port");
+
     let service = ProxyService::new(db);
     let mut config = service.get_config().await.expect("read proxy config");
     config.listen_port = 0;
-    service
-        .update_config(&config)
+    let proxy = service
+        .start_with_runtime_config(config)
         .await
-        .expect("update proxy config");
-
-    let proxy = service.start().await.expect("start proxy service");
+        .expect("start proxy service");
     let client = reqwest::Client::new();
     let response = client
         .post(format!(
@@ -259,7 +260,63 @@ async fn opus_request_uses_opus_model_override() {
 
 #[tokio::test]
 #[serial]
-async fn thinking_enabled_request_uses_reasoning_model_override() {
+async fn fable_request_uses_fable_model_override() {
+    let mut provider_env = Map::new();
+    provider_env.insert(
+        "ANTHROPIC_DEFAULT_FABLE_MODEL".to_string(),
+        json!("fable-mapped[1M]"),
+    );
+
+    assert_forwarded_model(MappingCase {
+        provider_env,
+        request_body: anthropic_request("claude-fable-5[1M]"),
+        expected_model: "fable-mapped",
+        upstream_format: UpstreamFormat::OpenAiChat,
+    })
+    .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn fable_request_falls_back_to_opus_model_override() {
+    let mut provider_env = Map::new();
+    provider_env.insert(
+        "ANTHROPIC_DEFAULT_OPUS_MODEL".to_string(),
+        json!("opus-for-fable"),
+    );
+    provider_env.insert("ANTHROPIC_MODEL".to_string(), json!("default-mapped"));
+
+    assert_forwarded_model(MappingCase {
+        provider_env,
+        request_body: anthropic_request("claude-fable-5"),
+        expected_model: "opus-for-fable",
+        upstream_format: UpstreamFormat::Anthropic,
+    })
+    .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn configured_subagent_model_bypasses_default_mapping() {
+    let mut provider_env = Map::new();
+    provider_env.insert(
+        "CLAUDE_CODE_SUBAGENT_MODEL".to_string(),
+        json!("gpt-5.4-mini"),
+    );
+    provider_env.insert("ANTHROPIC_MODEL".to_string(), json!("default-mapped"));
+
+    assert_forwarded_model(MappingCase {
+        provider_env,
+        request_body: anthropic_request("gpt-5.4-mini[1M]"),
+        expected_model: "gpt-5.4-mini",
+        upstream_format: UpstreamFormat::Anthropic,
+    })
+    .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn thinking_enabled_ignores_legacy_reasoning_model_override() {
     let mut provider_env = Map::new();
     provider_env.insert(
         "ANTHROPIC_REASONING_MODEL".to_string(),
@@ -271,7 +328,7 @@ async fn thinking_enabled_request_uses_reasoning_model_override() {
     assert_forwarded_model(MappingCase {
         provider_env,
         request_body,
-        expected_model: "reasoning-mapped",
+        expected_model: "claude-3-7-sonnet-20250219",
         upstream_format: UpstreamFormat::OpenAiChat,
     })
     .await;
@@ -279,7 +336,7 @@ async fn thinking_enabled_request_uses_reasoning_model_override() {
 
 #[tokio::test]
 #[serial]
-async fn thinking_adaptive_request_uses_reasoning_model_override() {
+async fn thinking_adaptive_ignores_legacy_reasoning_model_override() {
     let mut provider_env = Map::new();
     provider_env.insert(
         "ANTHROPIC_REASONING_MODEL".to_string(),
@@ -291,7 +348,7 @@ async fn thinking_adaptive_request_uses_reasoning_model_override() {
     assert_forwarded_model(MappingCase {
         provider_env,
         request_body,
-        expected_model: "reasoning-mapped",
+        expected_model: "claude-3-7-sonnet-20250219",
         upstream_format: UpstreamFormat::OpenAiChat,
     })
     .await;

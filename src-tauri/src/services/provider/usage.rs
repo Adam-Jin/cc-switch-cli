@@ -1,13 +1,20 @@
-use regex::Regex;
+use std::sync::OnceLock;
+
+use tokio::sync::RwLock;
 
 use crate::app_config::AppType;
 use crate::error::AppError;
 use crate::provider::{Provider, UsageData, UsageResult, UsageScript};
+use crate::proxy::providers::copilot_auth::CopilotAuthManager;
 use crate::settings;
 use crate::store::AppState;
-use crate::usage_script;
+use crate::usage_script::{self, UsageQueryTemplate};
 
 use super::ProviderService;
+
+const COPILOT_UNIT_PREMIUM: &str = "requests";
+
+static CLI_COPILOT_AUTH_MANAGER: OnceLock<RwLock<CopilotAuthManager>> = OnceLock::new();
 
 impl ProviderService {
     /// 执行用量脚本并格式化结果（私有辅助方法）
@@ -118,7 +125,7 @@ impl ProviderService {
             }
 
             let (api_key, base_url) =
-                Self::resolve_usage_script_credentials(&provider, &app_type, usage_script)?;
+                Self::resolve_usage_script_credentials(provider, &app_type, usage_script)?;
 
             (
                 usage_script.code.clone(),
@@ -141,6 +148,182 @@ impl ProviderService {
             template_type.as_deref(),
         )
         .await
+    }
+
+    /// 查询供应商用量，包含上游 Usage Query 的特殊模板分发。
+    pub async fn query_provider_usage(
+        state: &AppState,
+        app_type: AppType,
+        provider_id: &str,
+    ) -> Result<UsageResult, String> {
+        let providers = state
+            .db
+            .get_all_providers(app_type.as_str())
+            .map_err(|e| format!("Failed to get providers: {e}"))?;
+        let provider = providers.get(provider_id);
+        let usage_script = provider
+            .and_then(|p| p.meta.as_ref())
+            .and_then(|m| m.usage_script.as_ref());
+        let template_type = usage_script
+            .and_then(|s| s.template_type.as_deref())
+            .unwrap_or("");
+        let template = UsageQueryTemplate::from_str(template_type);
+
+        if template == Some(UsageQueryTemplate::GitHubCopilot) {
+            return Self::query_github_copilot_usage(provider).await;
+        }
+
+        if template == Some(UsageQueryTemplate::TokenPlan) {
+            let Some((provider, usage_script)) = provider.zip(usage_script) else {
+                return Err("Usage script is not configured".to_string());
+            };
+            let (api_key, base_url) =
+                Self::resolve_usage_script_credentials(provider, &app_type, usage_script)
+                    .map_err(|e| e.to_string())?;
+
+            let quota = crate::services::coding_plan::get_coding_plan_quota(&base_url, &api_key)
+                .await
+                .map_err(|e| format!("Failed to query coding plan: {e}"))?;
+
+            if !quota.success {
+                return Ok(UsageResult {
+                    success: false,
+                    data: None,
+                    error: quota.error,
+                });
+            }
+
+            let data: Vec<UsageData> = quota
+                .tiers
+                .iter()
+                .map(|tier| {
+                    let total = 100.0;
+                    let used = tier.utilization;
+                    let remaining = total - used;
+                    UsageData {
+                        plan_name: Some(tier.name.clone()),
+                        remaining: Some(remaining),
+                        total: Some(total),
+                        used: Some(used),
+                        unit: Some("%".to_string()),
+                        is_valid: Some(true),
+                        invalid_message: None,
+                        extra: tier.resets_at.clone(),
+                    }
+                })
+                .collect();
+
+            return Ok(UsageResult {
+                success: true,
+                data: if data.is_empty() { None } else { Some(data) },
+                error: None,
+            });
+        }
+
+        if template == Some(UsageQueryTemplate::Balance) {
+            let Some((provider, usage_script)) = provider.zip(usage_script) else {
+                return Err("Usage script is not configured".to_string());
+            };
+            let (api_key, base_url) =
+                Self::resolve_usage_script_credentials(provider, &app_type, usage_script)
+                    .map_err(|e| e.to_string())?;
+
+            return crate::services::balance::get_balance(&base_url, &api_key)
+                .await
+                .map_err(|e| format!("Failed to query balance: {e}"));
+        }
+
+        if template == Some(UsageQueryTemplate::OfficialSubscription) {
+            let tool = provider
+                .and_then(|provider| provider.official_subscription_tool(&app_type))
+                .ok_or_else(|| {
+                    "Official subscription Usage Query is only available for official providers"
+                        .to_string()
+                })?;
+            if !usage_script.is_some_and(|script| script.enabled) {
+                return Ok(UsageResult {
+                    success: false,
+                    data: None,
+                    error: Some("Usage query is disabled".to_string()),
+                });
+            }
+
+            let quota = crate::services::subscription::get_subscription_quota(tool)
+                .await
+                .map_err(|e| format!("Failed to query subscription quota: {e}"))?;
+
+            if !quota.success {
+                return Ok(UsageResult {
+                    success: false,
+                    data: None,
+                    error: quota.error.or(quota.credential_message),
+                });
+            }
+
+            let data = quota
+                .tiers
+                .iter()
+                .map(|tier| UsageData {
+                    plan_name: Some(tier.name.clone()),
+                    remaining: Some(100.0 - tier.utilization),
+                    total: Some(100.0),
+                    used: Some(tier.utilization),
+                    unit: Some("%".to_string()),
+                    is_valid: Some(true),
+                    invalid_message: None,
+                    extra: tier.resets_at.clone(),
+                })
+                .collect::<Vec<_>>();
+
+            return Ok(UsageResult {
+                success: true,
+                data: if data.is_empty() { None } else { Some(data) },
+                error: None,
+            });
+        }
+
+        Self::query_usage(state, app_type, provider_id)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn query_github_copilot_usage(
+        provider: Option<&Provider>,
+    ) -> Result<UsageResult, String> {
+        let copilot_account_id = provider
+            .and_then(|p| p.meta.as_ref())
+            .and_then(|m| m.managed_account_id_for(UsageQueryTemplate::GitHubCopilot.as_str()));
+        let manager = CLI_COPILOT_AUTH_MANAGER.get_or_init(|| {
+            RwLock::new(CopilotAuthManager::new(crate::config::get_app_config_dir()))
+        });
+        let auth_manager = manager.read().await;
+        let usage = match copilot_account_id.as_deref() {
+            Some(account_id) => auth_manager
+                .fetch_usage_for_account(account_id)
+                .await
+                .map_err(|e| format!("Failed to fetch Copilot usage: {e}"))?,
+            None => auth_manager
+                .fetch_usage()
+                .await
+                .map_err(|e| format!("Failed to fetch Copilot usage: {e}"))?,
+        };
+        let premium = &usage.quota_snapshots.premium_interactions;
+        let used = premium.entitlement - premium.remaining;
+
+        Ok(UsageResult {
+            success: true,
+            data: Some(vec![UsageData {
+                plan_name: Some(usage.copilot_plan),
+                remaining: Some(premium.remaining as f64),
+                total: Some(premium.entitlement as f64),
+                used: Some(used as f64),
+                unit: Some(COPILOT_UNIT_PREMIUM.to_string()),
+                is_valid: Some(true),
+                invalid_message: None,
+                extra: Some(format!("Reset: {}", usage.quota_reset_date)),
+            }]),
+            error: None,
+        })
     }
 
     /// 测试用量脚本（使用临时脚本内容，不保存）
@@ -267,6 +450,19 @@ impl ProviderService {
                     )
                 })
                 .map(|s| s.to_string()),
+            AppType::Hermes => provider
+                .settings_config
+                .get("apiKey")
+                .or_else(|| provider.settings_config.get("api_key"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    AppError::localized(
+                        "provider.hermes.api_key.missing",
+                        "缺少 API Key",
+                        "API key is missing",
+                    )
+                })
+                .map(|s| s.to_string()),
             AppType::OpenClaw => provider
                 .settings_config
                 .get("apiKey")
@@ -320,24 +516,13 @@ impl ProviderService {
                     ));
                 }
 
-                let re = Regex::new(r#"base_url\s*=\s*["']([^"']+)["']"#).map_err(|e| {
+                crate::codex_config::extract_codex_base_url(config_toml).ok_or_else(|| {
                     AppError::localized(
-                        "provider.regex_init_failed",
-                        format!("正则初始化失败: {e}"),
-                        format!("Failed to initialize regex: {e}"),
+                        "provider.codex.base_url.invalid",
+                        "config.toml 中 base_url 格式错误",
+                        "base_url in config.toml has invalid format",
                     )
-                })?;
-
-                re.captures(config_toml)
-                    .and_then(|caps| caps.get(1))
-                    .map(|m| m.as_str().to_string())
-                    .ok_or_else(|| {
-                        AppError::localized(
-                            "provider.codex.base_url.invalid",
-                            "config.toml 中 base_url 格式错误",
-                            "base_url in config.toml has invalid format",
-                        )
-                    })
+                })
             }
             AppType::Gemini => {
                 use crate::gemini_config::json_to_env;
@@ -356,6 +541,14 @@ impl ProviderService {
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string()),
+            AppType::Hermes => Ok(provider
+                .settings_config
+                .get("baseUrl")
+                .or_else(|| provider.settings_config.get("baseURL"))
+                .or_else(|| provider.settings_config.get("endpoint"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string()),
             AppType::OpenClaw => Ok(provider
                 .settings_config
                 .get("baseUrl")
@@ -365,6 +558,7 @@ impl ProviderService {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn extract_credentials(
         provider: &Provider,
         app_type: &AppType,
@@ -380,15 +574,20 @@ impl ProviderService {
         app_type: &AppType,
         usage_script: &UsageScript,
     ) -> Result<(String, String), AppError> {
-        let api_key = match usage_script.api_key.as_deref().map(str::trim) {
-            Some(value) if !value.is_empty() => value.to_string(),
-            _ => Self::extract_api_key(provider, app_type)?,
-        };
+        let api_key = usage_script
+            .api_key
+            .clone()
+            .filter(|k| !k.is_empty())
+            .or_else(|| Self::extract_api_key(provider, app_type).ok())
+            .unwrap_or_default();
 
-        let base_url = match usage_script.base_url.as_deref().map(str::trim) {
-            Some(value) if !value.is_empty() => value.to_string(),
-            _ => Self::extract_base_url(provider, app_type)?,
-        };
+        let base_url = usage_script
+            .base_url
+            .clone()
+            .filter(|u| !u.is_empty())
+            .or_else(|| Self::extract_base_url(provider, app_type).ok())
+            .map(|url| url.trim_end_matches('/').to_string())
+            .unwrap_or_default();
 
         Ok((api_key, base_url))
     }
@@ -401,6 +600,82 @@ mod tests {
     use crate::provider::{Provider, ProviderMeta, UsageScript};
     use axum::{routing::get, Router};
     use serde_json::json;
+
+    #[tokio::test]
+    async fn official_subscription_dispatch_honors_disabled_switch() {
+        let state = super::super::state_from_config(MultiAppConfig::default());
+        let mut provider = Provider::with_id(
+            "official".into(),
+            "Official".into(),
+            json!({"env": {}}),
+            None,
+        );
+        provider.category = Some("official".to_string());
+        provider.meta = Some(ProviderMeta {
+            usage_script: Some(UsageScript {
+                enabled: false,
+                language: "javascript".to_string(),
+                code: String::new(),
+                timeout: Some(10),
+                api_key: None,
+                base_url: None,
+                access_token: None,
+                user_id: None,
+                template_type: Some("official_subscription".to_string()),
+                auto_query_interval: Some(5),
+                coding_plan_provider: None,
+            }),
+            ..Default::default()
+        });
+        state
+            .db
+            .save_provider(AppType::Claude.as_str(), &provider)
+            .expect("save official provider");
+
+        let result = ProviderService::query_provider_usage(&state, AppType::Claude, "official")
+            .await
+            .expect("disabled native query returns a usage result");
+
+        assert!(!result.success);
+        assert_eq!(result.error.as_deref(), Some("Usage query is disabled"));
+    }
+
+    #[tokio::test]
+    async fn official_subscription_dispatch_rejects_custom_provider_before_network() {
+        let state = super::super::state_from_config(MultiAppConfig::default());
+        let mut provider = Provider::with_id(
+            "custom".into(),
+            "Custom".into(),
+            json!({"env": {"ANTHROPIC_BASE_URL": "https://relay.example.test"}}),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            usage_script: Some(UsageScript {
+                enabled: true,
+                language: "javascript".to_string(),
+                code: String::new(),
+                timeout: Some(10),
+                api_key: None,
+                base_url: None,
+                access_token: None,
+                user_id: None,
+                template_type: Some("official_subscription".to_string()),
+                auto_query_interval: Some(5),
+                coding_plan_provider: None,
+            }),
+            ..Default::default()
+        });
+        state
+            .db
+            .save_provider(AppType::Claude.as_str(), &provider)
+            .expect("save custom provider");
+
+        let error = ProviderService::query_provider_usage(&state, AppType::Claude, "custom")
+            .await
+            .expect_err("custom provider must not dispatch native OAuth quota");
+
+        assert!(error.contains("only available for official providers"));
+    }
 
     #[tokio::test]
     async fn query_usage_reads_provider_from_db_when_config_snapshot_is_stale() {
@@ -442,6 +717,7 @@ mod tests {
                 user_id: None,
                 template_type: None,
                 auto_query_interval: None,
+                coding_plan_provider: None,
             }),
             ..Default::default()
         });
@@ -468,5 +744,116 @@ mod tests {
         );
 
         server.abort();
+    }
+
+    #[test]
+    fn resolve_usage_script_credentials_reads_codex_provider_config() {
+        let provider = Provider::with_id(
+            "codex".to_string(),
+            "Codex Provider".to_string(),
+            json!({
+                "auth": {
+                    "OPENAI_API_KEY": "sk-codex"
+                },
+                "config": "model_provider = \"custom\"\n\
+                           # base_url = \"https://stale.example/v1\"\n\
+                           [model_providers.inactive]\n\
+                           base_url = \"https://inactive.example/v1\"\n\
+                           [model_providers.custom]\n\
+                           base_url = \"https://codex.example/v1\"\n"
+            }),
+            None,
+        );
+        let script = UsageScript {
+            enabled: true,
+            language: "javascript".to_string(),
+            code: String::new(),
+            timeout: None,
+            api_key: None,
+            base_url: None,
+            access_token: None,
+            user_id: None,
+            template_type: Some("general".to_string()),
+            auto_query_interval: None,
+            coding_plan_provider: None,
+        };
+
+        let (api_key, base_url) =
+            ProviderService::resolve_usage_script_credentials(&provider, &AppType::Codex, &script)
+                .expect("Codex credentials should resolve from provider config");
+
+        assert_eq!(api_key, "sk-codex");
+        assert_eq!(base_url, "https://codex.example/v1");
+    }
+
+    #[test]
+    fn resolve_usage_script_credentials_reads_openclaw_provider_config() {
+        let provider = Provider::with_id(
+            "openclaw".to_string(),
+            "OpenClaw Provider".to_string(),
+            json!({
+                "apiKey": "sk-openclaw",
+                "baseUrl": "https://openclaw.example/v1/"
+            }),
+            None,
+        );
+        let script = UsageScript {
+            enabled: true,
+            language: "javascript".to_string(),
+            code: String::new(),
+            timeout: None,
+            api_key: None,
+            base_url: None,
+            access_token: None,
+            user_id: None,
+            template_type: Some("balance".to_string()),
+            auto_query_interval: None,
+            coding_plan_provider: None,
+        };
+
+        let (api_key, base_url) = ProviderService::resolve_usage_script_credentials(
+            &provider,
+            &AppType::OpenClaw,
+            &script,
+        )
+        .expect("OpenClaw credentials should resolve from provider config");
+
+        assert_eq!(api_key, "sk-openclaw");
+        assert_eq!(base_url, "https://openclaw.example/v1");
+    }
+
+    #[test]
+    fn resolve_usage_script_credentials_prefers_usage_script_over_provider_config() {
+        let provider = Provider::with_id(
+            "claude".to_string(),
+            "Claude Provider".to_string(),
+            json!({
+                "env": {
+                    "ANTHROPIC_AUTH_TOKEN": "sk-provider",
+                    "ANTHROPIC_BASE_URL": "https://provider.example/v1"
+                }
+            }),
+            None,
+        );
+        let script = UsageScript {
+            enabled: true,
+            language: "javascript".to_string(),
+            code: String::new(),
+            timeout: None,
+            api_key: Some("sk-script".to_string()),
+            base_url: Some("https://script.example/v1/".to_string()),
+            access_token: None,
+            user_id: None,
+            template_type: Some("general".to_string()),
+            auto_query_interval: None,
+            coding_plan_provider: None,
+        };
+
+        let (api_key, base_url) =
+            ProviderService::resolve_usage_script_credentials(&provider, &AppType::Claude, &script)
+                .expect("usage script credentials should resolve");
+
+        assert_eq!(api_key, "sk-script");
+        assert_eq!(base_url, "https://script.example/v1");
     }
 }

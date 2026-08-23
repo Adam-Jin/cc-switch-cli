@@ -1,5 +1,7 @@
 use super::*;
 
+pub(crate) const HERMES_MEMORY_ROW_COUNT: usize = 2;
+
 impl App {
     fn open_openclaw_editor<T: serde::Serialize>(
         &mut self,
@@ -21,7 +23,6 @@ impl App {
             prompt: texts::tui_openclaw_daily_memory_create_prompt().to_string(),
             input: TextInput::new(initial),
             submit: TextSubmit::OpenClawDailyMemoryFilename,
-            secret: false,
         });
     }
 
@@ -47,9 +48,12 @@ impl App {
                     return Action::None;
                 };
                 if matches!(item, ConfigItem::CommonSnippet) {
-                    self.overlay = Overlay::CommonSnippetPicker {
-                        selected: snippet_picker_index_for_app_type(&self.app_type),
-                    };
+                    self.open_common_snippet_editor(
+                        self.app_type.clone(),
+                        data,
+                        None,
+                        CommonSnippetViewSource::Global,
+                    );
                 }
                 Action::None
             }
@@ -81,7 +85,6 @@ impl App {
                             prompt: texts::tui_config_export_prompt().to_string(),
                             input: TextInput::new(texts::tui_default_config_export_path()),
                             submit: TextSubmit::ConfigExport,
-                            secret: false,
                         });
                         Action::None
                     }
@@ -91,7 +94,6 @@ impl App {
                             prompt: texts::tui_config_import_prompt().to_string(),
                             input: TextInput::new(texts::tui_default_config_export_path()),
                             submit: TextSubmit::ConfigImport,
-                            secret: false,
                         });
                         Action::None
                     }
@@ -101,7 +103,6 @@ impl App {
                             prompt: texts::tui_config_backup_prompt().to_string(),
                             input: TextInput::new(""),
                             submit: TextSubmit::ConfigBackupName,
-                            secret: false,
                         });
                         Action::None
                     }
@@ -115,9 +116,12 @@ impl App {
                     }
                     ConfigItem::Validate => Action::ConfigValidate,
                     ConfigItem::CommonSnippet => {
-                        self.overlay = Overlay::CommonSnippetPicker {
-                            selected: snippet_picker_index_for_app_type(&self.app_type),
-                        };
+                        self.open_common_snippet_editor(
+                            self.app_type.clone(),
+                            data,
+                            None,
+                            CommonSnippetViewSource::Global,
+                        );
                         Action::None
                     }
                     ConfigItem::Proxy => Action::ConfigOpenProxyHelp,
@@ -128,7 +132,7 @@ impl App {
                         item.detail_route()
                             .expect("OpenClaw config item should define a detail route"),
                     ),
-                    ConfigItem::WebDavSync => self.push_route_and_switch(Route::ConfigWebDav),
+                    ConfigItem::CloudSync => self.push_route_and_switch(Route::ConfigCloudSync),
                     ConfigItem::Reset => {
                         self.overlay = Overlay::Confirm(ConfirmOverlay {
                             title: texts::tui_config_reset_title().to_string(),
@@ -226,6 +230,28 @@ impl App {
         }
     }
 
+    pub(crate) fn on_hermes_memory_key(&mut self, key: KeyEvent, data: &UiData) -> Action {
+        let selected = hermes_memory_kind_for_index(self.hermes_memory_idx);
+        match key.code {
+            KeyCode::Up => {
+                self.hermes_memory_idx = self.hermes_memory_idx.saturating_sub(1);
+                Action::None
+            }
+            KeyCode::Down => {
+                self.hermes_memory_idx =
+                    (self.hermes_memory_idx + 1).min(HERMES_MEMORY_ROW_COUNT - 1);
+                Action::None
+            }
+            KeyCode::Enter | KeyCode::Char('e') => Action::HermesMemoryOpen { kind: selected },
+            KeyCode::Char(' ') | KeyCode::Char('x') => Action::HermesMemorySetEnabled {
+                kind: selected,
+                enabled: !data.config.hermes_memory.enabled(selected),
+            },
+            KeyCode::Char('o') => Action::HermesOpenMemoryDirectory,
+            _ => Action::None,
+        }
+    }
+
     pub(crate) fn on_config_openclaw_env_key(&mut self, key: KeyEvent, data: &UiData) -> Action {
         match key.code {
             KeyCode::Enter | KeyCode::Char('e') => {
@@ -314,7 +340,6 @@ impl App {
             prompt: texts::tui_openclaw_tools_pattern_placeholder().to_string(),
             input: TextInput::new(initial),
             submit: TextSubmit::OpenClawToolsRule { section, row },
-            secret: false,
         });
         Action::None
     }
@@ -484,37 +509,35 @@ impl App {
             prompt: title.to_string(),
             input: TextInput::new(buffer),
             submit: TextSubmit::OpenClawAgentsRuntimeField { field },
-            secret: false,
         });
         Action::None
     }
 
     fn open_openclaw_agents_model_picker(&mut self, data: &UiData) -> Action {
         let model_options = super::openclaw_agents_model_options(data);
-        let Some((insert_at, selected, options)) = ({
+        let Some((insert_at, selected, active, options)) = ({
             let form = self.openclaw_agents_form(data);
             match form.section {
-                OpenClawAgentsSection::PrimaryModel => (!model_options.is_empty()).then(|| {
-                    (
-                        0,
-                        form.primary_model_picker_selection(&model_options),
-                        model_options.clone(),
-                    )
-                }),
+                OpenClawAgentsSection::PrimaryModel if !model_options.is_empty() => {
+                    let selected = form.primary_model_picker_selection(&model_options);
+                    let active =
+                        (selected != OPENCLAW_AGENTS_MODEL_PICKER_NONE).then_some(selected);
+                    Some((0, selected, active, model_options))
+                }
+                OpenClawAgentsSection::PrimaryModel => None,
                 OpenClawAgentsSection::FallbackModels => {
                     let row = form.row.min(form.fallbacks.len());
                     if row < form.fallbacks.len() {
                         let options = form.available_fallback_options_for_row(row, &model_options);
                         (!options.is_empty()).then(|| {
-                            (
-                                row,
-                                form.current_fallback_picker_selection(row, &options),
-                                options,
-                            )
+                            let selected = form.current_fallback_picker_selection(row, &options);
+                            let active =
+                                (selected != OPENCLAW_AGENTS_MODEL_PICKER_NONE).then_some(selected);
+                            (row, selected, active, options)
                         })
                     } else {
                         let options = form.available_fallback_options(&model_options);
-                        (!options.is_empty()).then(|| (row, 0, options))
+                        (!options.is_empty()).then_some((row, 0, None, options))
                     }
                 }
                 OpenClawAgentsSection::Runtime => None,
@@ -526,6 +549,7 @@ impl App {
         self.overlay = Overlay::OpenClawAgentsFallbackPicker {
             insert_at,
             selected,
+            active,
             options,
         };
         Action::None
@@ -599,37 +623,42 @@ impl App {
 
     pub(crate) fn on_config_webdav_key(&mut self, key: KeyEvent, data: &UiData) -> Action {
         let items = visible_webdav_config_items(&self.filter);
+        self.config_webdav_idx = self.config_webdav_idx.min(items.len().saturating_sub(1));
+        let configured = data.config.webdav_sync.is_some();
+        let enabled = data
+            .config
+            .webdav_sync
+            .as_ref()
+            .is_some_and(|settings| settings.enabled);
+        if items
+            .get(self.config_webdav_idx)
+            .is_some_and(|item| !item.available(configured, enabled))
+        {
+            self.config_webdav_idx = items
+                .iter()
+                .position(|item| item.available(configured, enabled))
+                .unwrap_or(0);
+        }
         match key.code {
             KeyCode::Up => {
-                self.config_webdav_idx = self.config_webdav_idx.saturating_sub(1);
-                Action::None
-            }
-            KeyCode::Down => {
-                if !items.is_empty() {
-                    self.config_webdav_idx = (self.config_webdav_idx + 1).min(items.len() - 1);
+                let mut next = self.config_webdav_idx;
+                while next > 0 {
+                    next -= 1;
+                    if items[next].available(configured, enabled) {
+                        self.config_webdav_idx = next;
+                        break;
+                    }
                 }
                 Action::None
             }
-            KeyCode::Char('e') => {
-                let Some(item) = items.get(self.config_webdav_idx) else {
-                    return Action::None;
-                };
-                if matches!(item, WebDavConfigItem::Settings) {
-                    let webdav_json = match data.config.webdav_sync.as_ref() {
-                        Some(cfg) => {
-                            serde_json::to_string_pretty(cfg).unwrap_or_else(|_| "{}".to_string())
-                        }
-                        None => serde_json::to_string_pretty(
-                            &crate::settings::WebDavSyncSettings::default(),
-                        )
-                        .unwrap_or_else(|_| "{}".to_string()),
-                    };
-                    self.open_editor(
-                        texts::tui_webdav_settings_editor_title(),
-                        EditorKind::Json,
-                        webdav_json,
-                        EditorSubmit::ConfigWebDavSettings,
-                    );
+            KeyCode::Down => {
+                let mut next = self.config_webdav_idx;
+                while next + 1 < items.len() {
+                    next += 1;
+                    if items[next].available(configured, enabled) {
+                        self.config_webdav_idx = next;
+                        break;
+                    }
                 }
                 Action::None
             }
@@ -637,28 +666,37 @@ impl App {
                 let Some(item) = items.get(self.config_webdav_idx) else {
                     return Action::None;
                 };
+                if !item.available(configured, enabled) {
+                    return Action::None;
+                }
                 match item {
                     WebDavConfigItem::Settings => {
-                        let webdav_json = match data.config.webdav_sync.as_ref() {
-                            Some(cfg) => serde_json::to_string_pretty(cfg)
-                                .unwrap_or_else(|_| "{}".to_string()),
-                            None => serde_json::to_string_pretty(
-                                &crate::settings::WebDavSyncSettings::default(),
-                            )
-                            .unwrap_or_else(|_| "{}".to_string()),
-                        };
-                        self.open_editor(
-                            texts::tui_webdav_settings_editor_title(),
-                            EditorKind::Json,
-                            webdav_json,
-                            EditorSubmit::ConfigWebDavSettings,
-                        );
+                        self.form = Some(FormState::WebDavSync(
+                            form::WebDavSyncFormState::from_settings(
+                                data.config.webdav_sync.as_ref(),
+                            ),
+                        ));
                         Action::None
                     }
                     WebDavConfigItem::CheckConnection => Action::ConfigWebDavCheckConnection,
                     WebDavConfigItem::Upload => Action::ConfigWebDavUpload,
                     WebDavConfigItem::Download => Action::ConfigWebDavDownload,
-                    WebDavConfigItem::Reset => Action::ConfigWebDavReset,
+                    WebDavConfigItem::EnableDisable if enabled => {
+                        Action::ConfigWebDavSetEnabled { enabled: false }
+                    }
+                    WebDavConfigItem::EnableDisable => {
+                        Action::ConfigWebDavSetEnabled { enabled: true }
+                    }
+                    WebDavConfigItem::Reset => {
+                        self.overlay = Overlay::Confirm(ConfirmOverlay {
+                            title: texts::tui_webdav_reset_title().to_string(),
+                            message: texts::tui_webdav_reset_message().to_string(),
+                            action: ConfirmAction::CloudSyncReset {
+                                backend: CloudSyncBackend::WebDav,
+                            },
+                        });
+                        Action::None
+                    }
                     WebDavConfigItem::JianguoyunQuickSetup => {
                         self.webdav_quick_setup_username = None;
                         self.overlay = Overlay::TextInput(TextInputState {
@@ -666,7 +704,6 @@ impl App {
                             prompt: texts::tui_webdav_jianguoyun_username_prompt().to_string(),
                             input: TextInput::new(""),
                             submit: TextSubmit::WebDavJianguoyunUsername,
-                            secret: false,
                         });
                         Action::None
                     }
@@ -676,7 +713,131 @@ impl App {
         }
     }
 
-    pub(crate) fn on_settings_key(&mut self, key: KeyEvent, _data: &UiData) -> Action {
+    pub(crate) fn on_config_cloud_sync_key(&mut self, key: KeyEvent) -> Action {
+        match key.code {
+            KeyCode::Up => {
+                self.config_cloud_sync_idx = self.config_cloud_sync_idx.saturating_sub(1);
+                Action::None
+            }
+            KeyCode::Down => {
+                self.config_cloud_sync_idx = (self.config_cloud_sync_idx + 1)
+                    .min(CloudSyncBackend::ALL.len().saturating_sub(1));
+                Action::None
+            }
+            KeyCode::Enter => match CloudSyncBackend::ALL.get(self.config_cloud_sync_idx) {
+                Some(CloudSyncBackend::WebDav) => self.push_route_and_switch(Route::ConfigWebDav),
+                Some(CloudSyncBackend::S3Compatible) => self.push_route_and_switch(Route::ConfigS3),
+                None => Action::None,
+            },
+            _ => Action::None,
+        }
+    }
+
+    pub(crate) fn clamp_s3_config_selection(&mut self, data: &UiData) {
+        let configured = data.config.s3_sync.is_some();
+        let enabled = data
+            .config
+            .s3_sync
+            .as_ref()
+            .is_some_and(|settings| settings.enabled);
+        let len = S3ConfigItem::ALL.len();
+        self.config_s3_idx = self.config_s3_idx.min(len.saturating_sub(1));
+        if S3ConfigItem::ALL
+            .get(self.config_s3_idx)
+            .is_some_and(|item| item.available(configured, enabled))
+        {
+            return;
+        }
+        self.config_s3_idx = S3ConfigItem::ALL
+            .iter()
+            .position(|item| item.available(configured, enabled))
+            .unwrap_or(0);
+    }
+
+    fn move_s3_config_selection(&mut self, data: &UiData, down: bool) {
+        let configured = data.config.s3_sync.is_some();
+        let enabled = data
+            .config
+            .s3_sync
+            .as_ref()
+            .is_some_and(|settings| settings.enabled);
+        let mut next = self.config_s3_idx;
+        loop {
+            let candidate = if down {
+                next.saturating_add(1)
+            } else {
+                next.saturating_sub(1)
+            };
+            if candidate == next || candidate >= S3ConfigItem::ALL.len() {
+                break;
+            }
+            next = candidate;
+            if S3ConfigItem::ALL[next].available(configured, enabled) {
+                self.config_s3_idx = next;
+                break;
+            }
+        }
+    }
+
+    pub(crate) fn on_config_s3_key(&mut self, key: KeyEvent, data: &UiData) -> Action {
+        self.clamp_s3_config_selection(data);
+        match key.code {
+            KeyCode::Up => {
+                self.move_s3_config_selection(data, false);
+                Action::None
+            }
+            KeyCode::Down => {
+                self.move_s3_config_selection(data, true);
+                Action::None
+            }
+            KeyCode::Enter => {
+                let Some(item) = S3ConfigItem::ALL.get(self.config_s3_idx).copied() else {
+                    return Action::None;
+                };
+                let configured = data.config.s3_sync.is_some();
+                let enabled = data
+                    .config
+                    .s3_sync
+                    .as_ref()
+                    .is_some_and(|settings| settings.enabled);
+                if !item.available(configured, enabled) {
+                    return Action::None;
+                }
+                match item {
+                    S3ConfigItem::Configure => {
+                        self.form = Some(FormState::S3Sync(form::S3SyncFormState::from_settings(
+                            data.config.s3_sync.as_ref(),
+                        )));
+                        Action::None
+                    }
+                    S3ConfigItem::CheckConnection => Action::ConfigS3CheckConnection,
+                    S3ConfigItem::Upload => Action::ConfigS3FetchRemoteInfo {
+                        intent: CloudSyncTransferIntent::Upload,
+                    },
+                    S3ConfigItem::Restore => Action::ConfigS3FetchRemoteInfo {
+                        intent: CloudSyncTransferIntent::Restore,
+                    },
+                    S3ConfigItem::EnableDisable if enabled => {
+                        Action::ConfigS3SetEnabled { enabled: false }
+                    }
+                    S3ConfigItem::EnableDisable => Action::ConfigS3SetEnabled { enabled: true },
+                    S3ConfigItem::Reset => {
+                        self.overlay = Overlay::Confirm(ConfirmOverlay {
+                            title: texts::tui_s3_reset_title().to_string(),
+                            message: texts::tui_s3_reset_message().to_string(),
+                            action: ConfirmAction::CloudSyncReset {
+                                backend: CloudSyncBackend::S3Compatible,
+                            },
+                        });
+                        Action::None
+                    }
+                }
+            }
+            _ => Action::None,
+        }
+    }
+
+    pub(crate) fn on_settings_key(&mut self, key: KeyEvent, data: &UiData) -> Action {
         let settings_len = SettingsItem::ALL.len();
         match key.code {
             KeyCode::Up => {
@@ -695,11 +856,98 @@ impl App {
                     };
                     Action::SetLanguage(next)
                 }
+                Some(SettingsItem::Theme) => {
+                    let next = crate::cli::tui::theme::configured_theme_mode().next();
+                    match crate::settings::set_theme_mode(next.code()) {
+                        Ok(()) => {
+                            self.push_toast(
+                                texts::tui_toast_theme_changed(
+                                    texts::tui_settings_theme_mode_name(next),
+                                ),
+                                ToastKind::Success,
+                            );
+                        }
+                        Err(err) => {
+                            self.push_toast(err.to_string(), ToastKind::Error);
+                        }
+                    }
+                    Action::None
+                }
+                Some(SettingsItem::Icons) => {
+                    // Cycle the *persisted* setting, not configured_icon_mode()
+                    // (which prefers the CC_SWITCH_ICONS override), so repeated
+                    // presses advance predictably even when an env override is
+                    // masking the effective mode.
+                    let current = crate::settings::get_icon_mode()
+                        .as_deref()
+                        .and_then(crate::cli::tui::icons::IconMode::parse)
+                        .unwrap_or_default();
+                    let next = current.next();
+                    match crate::settings::set_icon_mode(next.code()) {
+                        Ok(()) => {
+                            self.push_toast(
+                                texts::tui_toast_icons_changed(texts::tui_settings_icon_mode_name(
+                                    next,
+                                )),
+                                ToastKind::Success,
+                            );
+                        }
+                        Err(err) => {
+                            self.push_toast(err.to_string(), ToastKind::Error);
+                        }
+                    }
+                    Action::None
+                }
+                Some(SettingsItem::PreferredEditor) => {
+                    let editors = crate::cli::editor::detect_external_editors();
+                    let configured = crate::settings::get_preferred_editor();
+                    let selected = configured.as_deref().map_or(0, |command| {
+                        editors
+                            .iter()
+                            .position(|editor| editor.command == command)
+                            .unwrap_or(editors.len())
+                    });
+                    self.overlay = Overlay::ExternalEditorPicker { selected, editors };
+                    Action::None
+                }
+                Some(SettingsItem::VisibleAppsMode) => {
+                    let current = crate::settings::get_visible_apps_settings().mode;
+                    let next = match current {
+                        crate::settings::VisibleAppsMode::Auto => {
+                            crate::settings::VisibleAppsMode::Manual
+                        }
+                        crate::settings::VisibleAppsMode::Manual => {
+                            crate::settings::VisibleAppsMode::Auto
+                        }
+                    };
+                    Action::SetVisibleAppsMode { mode: next }
+                }
                 Some(SettingsItem::VisibleApps) => {
                     self.overlay = Overlay::VisibleAppsPicker {
                         selected: app_type_picker_index(&self.app_type),
                         apps: crate::settings::get_visible_apps(),
                     };
+                    Action::None
+                }
+                Some(SettingsItem::MachineLabels) => {
+                    let current = crate::machine::current_labels()
+                        .ok()
+                        .map(|labels| {
+                            let auto: std::collections::BTreeSet<String> =
+                                crate::machine::auto_labels().into_iter().collect();
+                            labels
+                                .into_iter()
+                                .filter(|l| !auto.contains(l))
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        })
+                        .unwrap_or_default();
+                    self.overlay = Overlay::TextInput(TextInputState {
+                        title: crate::t!("Machine labels", "本机标签").to_string(),
+                        prompt: machine_labels_prompt(),
+                        input: TextInput::new(current),
+                        submit: TextSubmit::MachineLabels,
+                    });
                     Action::None
                 }
                 Some(SettingsItem::OpenClawConfigDir) => {
@@ -711,9 +959,17 @@ impl App {
                         prompt: texts::tui_settings_openclaw_config_dir_prompt().to_string(),
                         input: TextInput::new(buffer),
                         submit: TextSubmit::SettingsOpenClawConfigDir,
-                        secret: false,
                     });
                     Action::None
+                }
+                Some(SettingsItem::ManagedAccounts) => {
+                    let action = self.push_route_and_switch(Route::SettingsManagedAccounts);
+                    if self.managed_auth_status.is_none() {
+                        return Action::ManagedAuthRefresh {
+                            auth_provider: "codex_oauth".to_string(),
+                        };
+                    }
+                    action
                 }
                 Some(SettingsItem::SkipClaudeOnboarding) => {
                     let current = crate::settings::get_skip_claude_onboarding();
@@ -748,11 +1004,96 @@ impl App {
                     });
                     Action::None
                 }
+                Some(SettingsItem::PreserveCodexOfficialAuth) => {
+                    let enabled = !crate::settings::preserve_codex_official_auth_on_switch();
+                    Action::SetPreserveCodexOfficialAuth { enabled }
+                }
+                Some(SettingsItem::CodexUnifiedSessionHistory) => {
+                    let current = crate::settings::unify_codex_session_history();
+                    let next = !current;
+                    let settings = crate::settings::get_settings();
+                    let show_restore =
+                        crate::codex_history_migration::has_codex_official_history_unify_backup()
+                            || settings.unify_codex_migrate_existing.unwrap_or(false);
+
+                    self.overlay = Overlay::CodexHistoryConfirm(CodexHistoryConfirmState {
+                        mode: if next {
+                            CodexHistoryConfirmMode::Enable
+                        } else {
+                            CodexHistoryConfirmMode::Disable
+                        },
+                        show_restore_checkbox: !next && show_restore,
+                        restore_checked: !next && show_restore,
+                    });
+                    Action::None
+                }
                 Some(SettingsItem::Proxy) => self.push_route_and_switch(Route::SettingsProxy),
+                Some(SettingsItem::OutboundProxy) => {
+                    if self.global_outbound_proxy_draft.is_none() {
+                        self.global_outbound_proxy_draft = Some(
+                            data.config
+                                .global_outbound_proxy
+                                .clone()
+                                .unwrap_or_default(),
+                        );
+                    }
+                    self.push_route_and_switch(Route::SettingsOutboundProxy)
+                }
                 Some(SettingsItem::CheckForUpdates) => Action::CheckUpdate,
                 None => Action::None,
             },
             _ => Action::None,
+        }
+    }
+
+    pub(crate) fn request_auto_failover_toggle(&mut self, data: &UiData) -> Action {
+        if !supports_failover_controls(&self.app_type) {
+            return Action::None;
+        }
+
+        let enabled = !data.proxy.auto_failover_enabled;
+        if !enabled {
+            return Action::SetProxyAutoFailover {
+                app_type: self.app_type.clone(),
+                enabled,
+            };
+        }
+
+        let queue_empty = !data
+            .providers
+            .rows
+            .iter()
+            .any(|row| row.provider.in_failover_queue);
+        if queue_empty {
+            self.push_toast(
+                crate::cli::failover_policy::auto_failover_queue_empty_message(),
+                ToastKind::Warning,
+            );
+            return Action::None;
+        }
+
+        if data
+            .proxy
+            .routes_current_app_through_proxy(&self.app_type)
+            .is_some_and(|active| !active)
+        {
+            self.overlay = Overlay::Confirm(ConfirmOverlay {
+                title: texts::tui_confirm_title().to_string(),
+                message: crate::t!(
+                    "Automatic failover requires proxy routing for this app. Enable proxy takeover for the app first?",
+                    "故障转移需要当前应用走代理才能生效。是否同时开启当前应用代理并启用故障转移？"
+                )
+                .to_string(),
+                action: ConfirmAction::ProxyEnableAndAutoFailover {
+                    app_type: self.app_type.clone(),
+                },
+            });
+            return Action::None;
+        }
+
+        Action::SetProxyAutoFailover {
+            app_type: self.app_type.clone(),
+            enabled,
         }
     }
 
@@ -769,18 +1110,12 @@ impl App {
             }
             KeyCode::Enter => match LocalProxySettingsItem::ALL.get(self.settings_proxy_idx) {
                 Some(LocalProxySettingsItem::AutoFailover) => {
-                    if !supports_failover_controls(&self.app_type) {
-                        return Action::None;
-                    }
-                    Action::SetProxyAutoFailover {
-                        app_type: self.app_type.clone(),
-                        enabled: !data.proxy.auto_failover_enabled,
-                    }
+                    self.request_auto_failover_toggle(data)
                 }
                 Some(LocalProxySettingsItem::ListenAddress) => {
                     if data.proxy.running {
                         self.push_toast(
-                            texts::tui_toast_proxy_settings_stop_before_edit(),
+                            texts::tui_toast_proxy_settings_stop_proxy_before_edit_address(),
                             ToastKind::Info,
                         );
                         return Action::None;
@@ -790,14 +1125,13 @@ impl App {
                         prompt: texts::tui_settings_proxy_listen_address_prompt().to_string(),
                         input: TextInput::new(data.proxy.configured_listen_address.clone()),
                         submit: TextSubmit::SettingsProxyListenAddress,
-                        secret: false,
                     });
                     Action::None
                 }
                 Some(LocalProxySettingsItem::ListenPort) => {
-                    if data.proxy.running {
+                    if data.proxy.has_active_worker_for(&self.app_type) {
                         self.push_toast(
-                            texts::tui_toast_proxy_settings_stop_before_edit(),
+                            texts::tui_toast_proxy_settings_stop_app_route_before_edit_port(),
                             ToastKind::Info,
                         );
                         return Action::None;
@@ -807,7 +1141,6 @@ impl App {
                         prompt: texts::tui_settings_proxy_listen_port_prompt().to_string(),
                         input: TextInput::new(data.proxy.configured_listen_port.to_string()),
                         submit: TextSubmit::SettingsProxyListenPort,
-                        secret: false,
                     });
                     Action::None
                 }
@@ -816,6 +1149,186 @@ impl App {
             _ => Action::None,
         }
     }
+
+    pub(crate) fn on_settings_outbound_proxy_key(
+        &mut self,
+        key: KeyEvent,
+        data: &UiData,
+    ) -> Action {
+        let items_len = GlobalOutboundProxySettingsItem::ALL.len();
+        match key.code {
+            KeyCode::Up => {
+                self.settings_outbound_proxy_idx =
+                    self.settings_outbound_proxy_idx.saturating_sub(1);
+                Action::None
+            }
+            KeyCode::Down => {
+                self.settings_outbound_proxy_idx =
+                    (self.settings_outbound_proxy_idx + 1).min(items_len - 1);
+                Action::None
+            }
+            KeyCode::Enter => {
+                let draft = self
+                    .global_outbound_proxy_draft
+                    .get_or_insert_with(|| {
+                        data.config
+                            .global_outbound_proxy
+                            .clone()
+                            .unwrap_or_default()
+                    })
+                    .clone();
+                match GlobalOutboundProxySettingsItem::ALL.get(self.settings_outbound_proxy_idx) {
+                    Some(GlobalOutboundProxySettingsItem::Url) => {
+                        self.overlay = Overlay::TextInput(global_outbound_proxy_text_input(
+                            TextSubmit::SettingsOutboundProxyUrl,
+                            draft.url,
+                        ));
+                        Action::None
+                    }
+                    Some(GlobalOutboundProxySettingsItem::Username) => {
+                        self.overlay = Overlay::TextInput(global_outbound_proxy_text_input(
+                            TextSubmit::SettingsOutboundProxyUsername,
+                            draft.username,
+                        ));
+                        Action::None
+                    }
+                    Some(GlobalOutboundProxySettingsItem::Password) => {
+                        self.overlay = Overlay::TextInput(global_outbound_proxy_text_input(
+                            TextSubmit::SettingsOutboundProxyPassword,
+                            draft.password,
+                        ));
+                        Action::None
+                    }
+                    None => Action::None,
+                }
+            }
+            _ => Action::None,
+        }
+    }
+
+    pub(crate) fn save_global_outbound_proxy(
+        &mut self,
+        config: crate::services::GlobalOutboundProxyConfig,
+    ) -> Action {
+        let full_url = match config.to_full_url() {
+            Ok(url) => url,
+            Err(error) => {
+                self.push_toast(global_outbound_proxy_error_message(error), ToastKind::Error);
+                return Action::None;
+            }
+        };
+        self.global_outbound_proxy_draft = Some(config.clone());
+        let environment_variables =
+            crate::services::global_proxy::configured_environment_variables();
+        if !full_url.is_empty() && !environment_variables.is_empty() {
+            self.overlay = Overlay::Confirm(ConfirmOverlay {
+                title: crate::t!("Environment proxy detected", "检测到环境变量代理")
+                    .to_string(),
+                message: crate::t!(
+                    "Proxy environment variables are set. Saving this configuration will take precedence over them. Continue?",
+                    "当前已设置代理环境变量。保存后，本配置的优先级将高于这些环境变量。是否继续？"
+                )
+                .to_string(),
+                action: ConfirmAction::SettingsSetGlobalOutboundProxy { config },
+            });
+            Action::None
+        } else {
+            Action::SetGlobalOutboundProxy { config }
+        }
+    }
+
+    pub(crate) fn on_settings_managed_accounts_key(
+        &mut self,
+        key: KeyEvent,
+        _data: &UiData,
+    ) -> Action {
+        let account_count = self.managed_auth_account_count();
+        match key.code {
+            KeyCode::Up => {
+                self.settings_managed_accounts_idx =
+                    self.settings_managed_accounts_idx.saturating_sub(1);
+                Action::None
+            }
+            KeyCode::Down => {
+                self.settings_managed_accounts_idx =
+                    (self.settings_managed_accounts_idx + 1).min(account_count.saturating_sub(1));
+                Action::None
+            }
+            KeyCode::Char('a') => self.start_managed_account_login(),
+            KeyCode::Char('r') => Action::ManagedAuthRefresh {
+                auth_provider: "codex_oauth".to_string(),
+            },
+            KeyCode::Char(' ') => self.switch_selected_managed_account(),
+            KeyCode::Enter => self.activate_managed_account_row(),
+            _ => Action::None,
+        }
+    }
+
+    fn managed_auth_account_count(&self) -> usize {
+        self.managed_auth_status
+            .as_ref()
+            .map(|status| status.accounts.len())
+            .unwrap_or(0)
+    }
+
+    fn selected_managed_account(&self) -> Option<&crate::services::ManagedAuthAccount> {
+        let status = self.managed_auth_status.as_ref()?;
+        status.accounts.get(
+            self.settings_managed_accounts_idx
+                .min(status.accounts.len().saturating_sub(1)),
+        )
+    }
+
+    fn start_managed_account_login(&mut self) -> Action {
+        if self.managed_auth_loading || self.managed_auth_login.is_some() {
+            return Action::None;
+        }
+
+        Action::ManagedAuthStartLogin {
+            auth_provider: "codex_oauth".to_string(),
+        }
+    }
+
+    fn switch_selected_managed_account(&mut self) -> Action {
+        if self.managed_auth_loading || self.managed_auth_login.is_some() {
+            return Action::None;
+        }
+
+        let Some(account) = self.selected_managed_account() else {
+            return Action::None;
+        };
+
+        Action::ManagedAuthSetDefault {
+            auth_provider: "codex_oauth".to_string(),
+            account_id: account.id.clone(),
+        }
+    }
+
+    fn activate_managed_account_row(&mut self) -> Action {
+        if self.managed_auth_loading || self.managed_auth_login.is_some() {
+            return Action::None;
+        }
+
+        if self.managed_auth_status.is_none() {
+            return Action::ManagedAuthRefresh {
+                auth_provider: "codex_oauth".to_string(),
+            };
+        }
+
+        if let Some(account) = self.selected_managed_account() {
+            self.overlay = Overlay::ManagedAccountActionPicker {
+                auth_provider: "codex_oauth".to_string(),
+                account_id: account.id.clone(),
+                selected: 0,
+            };
+            return Action::None;
+        }
+
+        Action::ManagedAuthStartLogin {
+            auth_provider: "codex_oauth".to_string(),
+        }
+    }
+
     pub fn open_editor(
         &mut self,
         title: impl Into<String>,
@@ -841,25 +1354,6 @@ impl App {
         }
     }
 
-    pub(crate) fn open_common_snippet_view(&mut self, app_type: AppType, data: &UiData) {
-        let snippet = self.common_snippet_text_for(&app_type, data);
-        let snippet = if snippet.trim().is_empty() {
-            texts::tui_default_common_snippet_for_app(app_type.as_str()).to_string()
-        } else {
-            snippet
-        };
-
-        self.overlay = Overlay::CommonSnippetView {
-            app_type: app_type.clone(),
-            view: TextViewState {
-                title: texts::tui_common_snippet_title(app_type.as_str()),
-                lines: snippet.lines().map(|s| s.to_string()).collect(),
-                scroll: 0,
-                action: None,
-            },
-        };
-    }
-
     pub(crate) fn open_proxy_help_view(
         &mut self,
         data: &UiData,
@@ -876,32 +1370,25 @@ impl App {
         } else {
             crate::t!("stopped", "未运行")
         };
-        let current_takeover = data.proxy.takeover_enabled_for(&self.app_type);
-        let current_app_routed = data.proxy.routes_current_app_through_proxy(&self.app_type);
-        let proxy_action_available = current_app_routed.is_some_and(|current_app_routed| {
-            !data.proxy.running || data.proxy.managed_runtime || current_app_routed
+        let current_route = data.proxy.routes_current_app_through_proxy(&self.app_type);
+        let proxy_action_available = current_route.is_some_and(|current_route| {
+            !data.proxy.running || data.proxy.managed_runtime || current_route
         });
-        let takeover_state = match current_takeover {
-            Some(true) => crate::t!("active", "已接管"),
-            Some(false) => crate::t!("inactive", "未接管"),
+        let route_state = match current_route {
+            Some(true) => crate::t!("enabled", "开启"),
+            Some(false) => crate::t!("disabled", "关闭"),
             None => crate::t!("not supported", "不支持"),
         };
-        let toggle_action = match current_app_routed {
-            Some(true) if proxy_action_available => Some(TextViewAction::ProxyToggleTakeover {
-                app_type: self.app_type.clone(),
-                enabled: false,
-            }),
-            Some(false) if proxy_action_available => Some(TextViewAction::ProxyToggleTakeover {
-                app_type: self.app_type.clone(),
-                enabled: true,
-            }),
-            _ => None,
+        let toggle_action = if current_route.is_some() && proxy_action_available {
+            Some(TextViewAction::ProxyToggleManagedRoute)
+        } else {
+            None
         };
 
         let mut lines = vec![
             crate::t!(
-                "Manual takeover status for the foreground proxy.",
-                "前台代理的手动接管状态。"
+                "Managed proxy routing for the current app.",
+                "当前应用的托管代理路由状态。"
             )
             .to_string(),
             String::new(),
@@ -915,19 +1402,15 @@ impl App {
                 crate::t!("Current provider", "当前供应商"),
                 current_provider
             ),
+            format!("{}: {}", crate::t!("Runtime", "运行态"), runtime_state),
             format!(
                 "{}: {}",
-                crate::t!("Foreground runtime", "前台运行态"),
-                runtime_state
-            ),
-            format!(
-                "{}: {}",
-                crate::t!("Current app takeover", "当前应用接管"),
-                takeover_state
+                crate::t!("Current app route", "当前应用路由"),
+                route_state
             ),
             crate::t!(
-                "Manual takeover only. Automatic failover is disabled.",
-                "仅支持手动接管，不提供自动故障转移。"
+                "Proxy routes are started and stopped by the cc-switch daemon.",
+                "代理路由由 cc-switch daemon 启停。"
             )
             .to_string(),
         ];
@@ -951,17 +1434,23 @@ impl App {
                 ),
             ]);
         } else {
-            lines.push(
-                crate::t!(
-                    "Proxy configuration is unavailable.",
-                    "代理配置暂时不可用。"
-                )
-                .to_string(),
-            );
+            let current_app_has_active_worker = data.proxy.has_active_worker_for(&self.app_type);
+            let port_edit_hint =
+                texts::tui_settings_proxy_stop_before_edit_hint(current_app_has_active_worker)
+                    .to_string();
+            lines.extend([
+                format!(
+                    "{}: {}:{}",
+                    crate::t!("Listen", "监听"),
+                    data.proxy.configured_listen_address,
+                    data.proxy.configured_listen_port
+                ),
+                port_edit_hint,
+            ]);
         }
 
         lines.push(String::new());
-        lines.push(match current_app_routed {
+        lines.push(match current_route {
             Some(true) => crate::t!(
                 "Press T to restore the current app to its live config.",
                 "按 T 恢复当前应用的 live 配置。"
@@ -981,8 +1470,8 @@ impl App {
             )
             .to_string(),
             None => crate::t!(
-                "This app does not support proxy takeover in the TUI.",
-                "这个应用暂不支持在 TUI 中进行代理接管。"
+                "This app does not support managed proxy routing in the TUI.",
+                "这个应用暂不支持在 TUI 中使用托管代理路由。"
             )
             .to_string(),
         });
@@ -1031,6 +1520,7 @@ impl App {
         app_type: AppType,
         data: &UiData,
         initial_override: Option<String>,
+        source: CommonSnippetViewSource,
     ) {
         let snippet = initial_override.unwrap_or_else(|| {
             let snippet = self.common_snippet_text_for(&app_type, data);
@@ -1042,7 +1532,7 @@ impl App {
         });
 
         let kind = if matches!(app_type, AppType::Codex) {
-            EditorKind::Plain
+            EditorKind::Toml
         } else {
             EditorKind::Json
         };
@@ -1051,29 +1541,75 @@ impl App {
             texts::tui_common_snippet_title(app_type.as_str()),
             kind,
             snippet,
-            EditorSubmit::ConfigCommonSnippet { app_type },
+            EditorSubmit::ConfigCommonSnippet { app_type, source },
         );
     }
 
-    pub(crate) fn open_provider_add_form(&mut self) {
-        self.filter.active = false;
-        self.overlay = Overlay::None;
-        self.focus = Focus::Content;
-        self.editor = None;
-        self.form = Some(FormState::ProviderAdd(ProviderAddFormState::new(
-            self.app_type.clone(),
-        )));
+    fn maybe_show_common_config_notice(&mut self) {
+        if self.common_config_notice_confirmed
+            || !ProviderAddFormState::supports_common_config(&self.app_type)
+        {
+            return;
+        }
+
+        self.overlay = Overlay::Confirm(ConfirmOverlay {
+            title: texts::tui_common_config_notice_title().to_string(),
+            message: texts::tui_common_config_notice_message(self.app_type.as_str()),
+            action: ConfirmAction::CommonConfigNotice,
+        });
     }
 
-    pub(crate) fn open_provider_edit_form(&mut self, row: &super::data::ProviderRow) {
+    pub(crate) fn open_provider_add_form(&mut self, data: &UiData) {
         self.filter.active = false;
         self.overlay = Overlay::None;
         self.focus = Focus::Content;
         self.editor = None;
-        self.form = Some(FormState::ProviderAdd(ProviderAddFormState::from_provider(
-            self.app_type.clone(),
-            &row.provider,
-        )));
+        self.form = Some(FormState::ProviderAdd(
+            ProviderAddFormState::new_with_common_snippet(
+                self.app_type.clone(),
+                &data.config.common_snippet,
+            ),
+        ));
+        self.maybe_show_common_config_notice();
+    }
+
+    pub(crate) fn open_provider_edit_form(
+        &mut self,
+        row: &super::data::ProviderRow,
+        data: &UiData,
+    ) {
+        self.filter.active = false;
+        self.overlay = Overlay::None;
+        self.focus = Focus::Content;
+        self.editor = None;
+        self.form = Some(FormState::ProviderAdd(
+            ProviderAddFormState::from_provider_with_common_snippet(
+                self.app_type.clone(),
+                &row.provider,
+                &data.config.common_snippet,
+            ),
+        ));
+        self.maybe_show_common_config_notice();
+    }
+
+    pub(crate) fn open_provider_copy_form(
+        &mut self,
+        row: &super::data::ProviderRow,
+        data: &UiData,
+    ) {
+        self.filter.active = false;
+        self.overlay = Overlay::None;
+        self.focus = Focus::Content;
+        self.editor = None;
+        self.form = Some(FormState::ProviderAdd(
+            ProviderAddFormState::copy_from_provider_with_common_snippet(
+                self.app_type.clone(),
+                &row.provider,
+                &data.config.common_snippet,
+                &data.existing_provider_ids(),
+            ),
+        ));
+        self.maybe_show_common_config_notice();
     }
 
     pub(crate) fn open_mcp_add_form(&mut self) {
@@ -1092,22 +1628,31 @@ impl App {
         self.overlay = Overlay::None;
         self.focus = Focus::Content;
         self.editor = None;
-        self.form = Some(FormState::McpAdd(McpAddFormState::from_server(&row.server)));
+        self.form = Some(FormState::McpAdd(McpAddFormState::from_shared_server(
+            std::sync::Arc::clone(&row.server),
+        )));
     }
 
-    pub(crate) fn open_prompt_create_name_input(&mut self) {
+    pub(crate) fn open_prompt_create_form(&mut self, data: &UiData) {
         self.filter.active = false;
         self.editor = None;
-        self.overlay = Overlay::TextInput(TextInputState {
-            title: texts::tui_prompt_create_title().to_string(),
-            prompt: texts::tui_prompt_create_prompt().to_string(),
-            input: TextInput::new(format!(
-                "Prompt {}",
-                chrono::Local::now().format("%Y-%m-%d %H:%M")
-            )),
-            submit: TextSubmit::PromptCreateName,
-            secret: false,
-        });
+        self.overlay = Overlay::None;
+        let name = format!("Prompt {}", chrono::Local::now().format("%Y-%m-%d %H:%M"));
+        let existing_ids = data
+            .prompts
+            .rows
+            .iter()
+            .map(|row| row.id.clone())
+            .collect::<Vec<_>>();
+        let id = crate::services::PromptService::generate_prompt_id(&name, &existing_ids);
+        self.form = Some(FormState::PromptMeta(PromptMetaFormState::new(id, name)));
         self.focus = Focus::Content;
+    }
+}
+
+pub(crate) fn hermes_memory_kind_for_index(index: usize) -> crate::hermes_config::MemoryKind {
+    match index.min(HERMES_MEMORY_ROW_COUNT - 1) {
+        1 => crate::hermes_config::MemoryKind::User,
+        _ => crate::hermes_config::MemoryKind::Memory,
     }
 }

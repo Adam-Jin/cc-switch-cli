@@ -2,9 +2,12 @@
 //!
 //! 提供键值对形式的通用设置存储。
 
-use crate::database::{lock_conn, Database};
+#[cfg(unix)]
+use crate::database::validate_existing_database_file;
+use crate::database::{database_path, lock_conn, readonly_database_open_flags, Database};
 use crate::error::AppError;
-use rusqlite::params;
+use rusqlite::{params, Connection, OptionalExtension};
+use std::time::Duration;
 
 impl Database {
     /// 获取设置值
@@ -74,6 +77,40 @@ impl Database {
         }
     }
 
+    /// 通用配置片段“已被用户显式清空”标记的键名
+    fn config_snippet_cleared_key(app_type: &str) -> String {
+        format!("common_config_{app_type}_cleared")
+    }
+
+    /// 通用配置片段是否被用户显式清空
+    pub fn is_config_snippet_cleared(&self, app_type: &str) -> Result<bool, AppError> {
+        Ok(self
+            .get_setting(&Self::config_snippet_cleared_key(app_type))?
+            .as_deref()
+            == Some("true"))
+    }
+
+    /// 设置/清除“通用配置片段已被显式清空”标记
+    pub fn set_config_snippet_cleared(
+        &self,
+        app_type: &str,
+        cleared: bool,
+    ) -> Result<(), AppError> {
+        let key = Self::config_snippet_cleared_key(app_type);
+        if cleared {
+            self.set_setting(&key, "true")
+        } else {
+            self.delete_setting(&key)
+        }
+    }
+
+    /// 当前是否允许从 live 配置自动播种通用配置片段：
+    /// 片段为空且未被用户显式清空时返回 true
+    pub fn should_auto_extract_config_snippet(&self, app_type: &str) -> Result<bool, AppError> {
+        Ok(self.get_config_snippet(app_type)?.is_none()
+            && !self.is_config_snippet_cleared(app_type)?)
+    }
+
     // --- 全局出站代理 ---
 
     /// 全局代理 URL 的存储键名
@@ -81,16 +118,43 @@ impl Database {
 
     /// 获取全局出站代理 URL
     ///
-    /// 返回 None 表示未配置或已清除代理（直连）
+    /// 返回 None 表示未配置或已清除代理（运行时可回退到环境变量）
     /// 返回 Some(url) 表示已配置代理
     pub fn get_global_proxy_url(&self) -> Result<Option<String>, AppError> {
         self.get_setting(Self::GLOBAL_PROXY_URL_KEY)
     }
 
+    /// Read only this backward-compatible setting without requiring the whole
+    /// database schema to match this binary. Update and OAuth commands use this
+    /// path so a future schema does not prevent them from reaching the network.
+    pub(crate) fn read_global_proxy_url_from_disk_compatible() -> Result<Option<String>, AppError> {
+        let db_path = database_path()?;
+        if !db_path.exists() {
+            return Err(AppError::Database(format!(
+                "database is not initialized: {}",
+                db_path.display()
+            )));
+        }
+        #[cfg(unix)]
+        validate_existing_database_file(&db_path)?;
+
+        let conn = Connection::open_with_flags(&db_path, readonly_database_open_flags())
+            .map_err(|error| AppError::Database(error.to_string()))?;
+        conn.busy_timeout(Duration::from_secs(5))
+            .map_err(|error| AppError::Database(error.to_string()))?;
+        conn.query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            params![Self::GLOBAL_PROXY_URL_KEY],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| AppError::Database(error.to_string()))
+    }
+
     /// 设置全局出站代理 URL
     ///
     /// - 传入非空字符串：启用代理
-    /// - 传入空字符串或 None：清除代理设置（直连）
+    /// - 传入空字符串或 None：清除代理设置
     pub fn set_global_proxy_url(&self, url: Option<&str>) -> Result<(), AppError> {
         match url {
             Some(u) if !u.trim().is_empty() => {
@@ -217,6 +281,27 @@ impl Database {
         self.set_setting("optimizer_config", &json)
     }
 
+    // --- Copilot 优化器配置 ---
+
+    pub fn get_copilot_optimizer_config(
+        &self,
+    ) -> Result<crate::proxy::types::CopilotOptimizerConfig, AppError> {
+        match self.get_setting("copilot_optimizer_config")? {
+            Some(json) => serde_json::from_str(&json)
+                .map_err(|e| AppError::Database(format!("解析 Copilot 优化器配置失败: {e}"))),
+            None => Ok(crate::proxy::types::CopilotOptimizerConfig::default()),
+        }
+    }
+
+    pub fn set_copilot_optimizer_config(
+        &self,
+        config: &crate::proxy::types::CopilotOptimizerConfig,
+    ) -> Result<(), AppError> {
+        let json = serde_json::to_string(config)
+            .map_err(|e| AppError::Database(format!("序列化 Copilot 优化器配置失败: {e}")))?;
+        self.set_setting("copilot_optimizer_config", &json)
+    }
+
     // --- 日志配置 ---
 
     /// 获取日志配置
@@ -259,5 +344,57 @@ mod tests {
         assert!(!loaded.thinking_optimizer);
         assert!(loaded.cache_injection);
         assert_eq!(loaded.cache_ttl, "5m");
+    }
+
+    #[test]
+    fn copilot_optimizer_config_defaults_when_missing() {
+        let db = Database::memory().expect("create memory db");
+
+        let loaded = db
+            .get_copilot_optimizer_config()
+            .expect("load default copilot optimizer config");
+
+        assert!(loaded.enabled);
+        assert!(loaded.request_classification);
+        assert!(loaded.tool_result_merging);
+        assert!(loaded.compact_detection);
+        assert!(loaded.deterministic_request_id);
+        assert!(loaded.subagent_detection);
+        assert!(loaded.warmup_downgrade);
+        assert_eq!(loaded.warmup_model, "gpt-5-mini");
+        assert!(loaded.strip_thinking);
+    }
+
+    #[test]
+    fn copilot_optimizer_config_roundtrip_uses_settings_storage() {
+        let db = Database::memory().expect("create memory db");
+        let config = crate::proxy::types::CopilotOptimizerConfig {
+            enabled: false,
+            request_classification: false,
+            tool_result_merging: false,
+            compact_detection: false,
+            deterministic_request_id: false,
+            subagent_detection: false,
+            warmup_downgrade: false,
+            warmup_model: "gpt-test-mini".to_string(),
+            strip_thinking: false,
+        };
+
+        db.set_copilot_optimizer_config(&config)
+            .expect("persist copilot optimizer config");
+
+        let loaded = db
+            .get_copilot_optimizer_config()
+            .expect("load copilot optimizer config");
+
+        assert!(!loaded.enabled);
+        assert!(!loaded.request_classification);
+        assert!(!loaded.tool_result_merging);
+        assert!(!loaded.compact_detection);
+        assert!(!loaded.deterministic_request_id);
+        assert!(!loaded.subagent_detection);
+        assert!(!loaded.warmup_downgrade);
+        assert_eq!(loaded.warmup_model, "gpt-test-mini");
+        assert!(!loaded.strip_thinking);
     }
 }

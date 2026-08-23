@@ -5,7 +5,7 @@ use crate::services::McpService;
 
 use super::super::app::ToastKind;
 use super::super::data::{load_state, UiData};
-use super::helpers::import_mcp_for_current_app;
+use super::helpers::import_mcp_from_supported_apps;
 use super::RuntimeActionContext;
 
 pub(super) fn toggle(
@@ -57,6 +57,7 @@ pub(super) fn set_apps(
         AppType::Codex,
         AppType::Gemini,
         AppType::OpenCode,
+        AppType::Hermes,
     ] {
         let next_enabled = apps.is_enabled_for(&app_type);
         if before.is_enabled_for(&app_type) == next_enabled {
@@ -84,6 +85,30 @@ pub(super) fn set_apps(
     Ok(())
 }
 
+pub(super) fn set_machine_selector(
+    ctx: &mut RuntimeActionContext<'_>,
+    id: String,
+    selector: crate::app_config::MachineSelector,
+) -> Result<(), AppError> {
+    let state = load_state()?;
+    let servers = McpService::get_all_servers(&state)?;
+    let Some(mut server) = servers.get(&id).cloned() else {
+        ctx.app
+            .push_toast(texts::tui_toast_mcp_server_not_found(), ToastKind::Warning);
+        return Ok(());
+    };
+
+    server.machine_selector = selector;
+    // upsert 会持久化并按 selector 重新同步（本机不匹配则从 live 配置移除）。
+    McpService::upsert_server(&state, server)?;
+
+    ctx.app
+        .push_toast(texts::tui_toast_mcp_updated(), ToastKind::Success);
+    ctx.app.refresh_machine_labels();
+    *ctx.data = UiData::load(&ctx.app.app_type)?;
+    Ok(())
+}
+
 pub(super) fn delete(ctx: &mut RuntimeActionContext<'_>, id: String) -> Result<(), AppError> {
     let state = load_state()?;
     let deleted = McpService::delete_server(&state, &id)?;
@@ -98,6 +123,6 @@ pub(super) fn delete(ctx: &mut RuntimeActionContext<'_>, id: String) -> Result<(
     Ok(())
 }
 
-pub(super) fn import_current_app(ctx: &mut RuntimeActionContext<'_>) -> Result<(), AppError> {
-    import_mcp_for_current_app(ctx.app, ctx.data)
+pub(super) fn import_supported_apps(ctx: &mut RuntimeActionContext<'_>) -> Result<(), AppError> {
+    import_mcp_from_supported_apps(ctx.app, ctx.data)
 }

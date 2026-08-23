@@ -74,7 +74,7 @@ pub(super) fn render_main(
         Style::default().add_modifier(Modifier::BOLD)
     } else {
         Style::default()
-            .fg(Color::White)
+            .fg(theme.fg_strong)
             .add_modifier(Modifier::BOLD)
     };
 
@@ -93,6 +93,12 @@ pub(super) fn render_main(
         .last_error
         .clone()
         .unwrap_or_else(|| texts::none().to_string());
+    let auto_failover_queue_len = data
+        .providers
+        .rows
+        .iter()
+        .filter(|row| row.provider.in_failover_queue)
+        .count();
     let current_quota_line = data
         .providers
         .rows
@@ -223,38 +229,60 @@ pub(super) fn render_main(
         Style::default().fg(theme.surface)
     };
 
-    let webdav_lines = vec![
-        kv_line(
-            theme,
-            texts::tui_label_webdav_status(),
-            label_width,
-            vec![Span::styled(
-                webdav_status_text.clone(),
-                webdav_status_style,
-            )],
+    // The WebDAV card was folded into the connection card: one compact line
+    // carrying the same status glyph plus the last-sync time.
+    let webdav_glyph = if has_error {
+        "!"
+    } else if is_ok {
+        webdav_ok_glyph()
+    } else {
+        webdav_neutral_glyph()
+    };
+    let webdav_spans = vec![
+        Span::styled(format!("{webdav_glyph} "), webdav_status_style),
+        Span::styled(webdav_status_text.clone(), webdav_status_style),
+        Span::styled(
+            home_separator().to_string(),
+            Style::default().fg(theme.comment),
         ),
-        kv_line(
-            theme,
-            texts::tui_label_webdav_last_sync(),
-            label_width,
-            vec![Span::styled(
-                webdav_last_sync_text.clone(),
-                webdav_last_sync_style,
-            )],
-        ),
+        Span::styled(webdav_last_sync_text.clone(), webdav_last_sync_style),
     ];
+
+    // Keep WebDAV on its own connection-card row. Quota text is provider
+    // controlled and can be wider than the terminal; appending WebDAV after it
+    // made sync errors disappear entirely when the row was clipped.
+    connection_lines.push(kv_line(
+        theme,
+        texts::tui_home_section_webdav(),
+        label_width,
+        webdav_spans,
+    ));
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(pane_border_style(app, Focus::Content, theme))
-        .title(texts::welcome_title());
+        .title(format!(" {} ", icons::strip_icon(texts::welcome_title())));
     frame.render_widget(block.clone(), area);
 
     let inner = block.inner(area);
     let content = inset_left(inner, CONTENT_INSET_LEFT);
-    let bottom_hero_height = if current_app_routed { 11 } else { 7 };
-    let connection_card_height = (connection_lines.len() as u16 + 2).max(4);
+    // The ASCII logo hero is gone: without the proxy dashboard the chart owns
+    // the whole elastic region below the env-check card.
+    let bottom_hero_height = if current_app_routed { 10 } else { 0 };
+    // The card does not wrap. Ratatui word-wraps, so a wrap estimate built from
+    // character counts under-counts on narrow terminals and clips the last line
+    // (the WebDAV one) out of the card. Clipping each line to the card's content
+    // width instead makes the row count exact: one line, one row.
+    let card_text_width = content.width.saturating_sub(2);
+    for line in &mut connection_lines {
+        let spans = std::mem::take(&mut line.spans);
+        line.spans = truncate_spans_to_width(spans, card_text_width);
+    }
+    // usize until the final clamp: an absurdly long provider name or URL must
+    // not wrap the arithmetic into a plausible-looking height.
+    let connection_card_height =
+        u16::try_from(connection_lines.len().saturating_add(2).max(4)).unwrap_or(u16::MAX);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(bottom_hero_height)])
@@ -263,31 +291,21 @@ pub(super) fn render_main(
     let top_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
             Constraint::Length(connection_card_height),
-            Constraint::Length(4),
-            Constraint::Length(6),
+            Constraint::Length(8),
             Constraint::Min(0),
         ])
         .split(chunks[0]);
 
     let card_border = Style::default().fg(theme.dim);
-    render_connection_card(frame, top_chunks[1], theme, &connection_lines, card_border);
-    render_webdav_card(frame, top_chunks[2], theme, &webdav_lines, card_border);
-    render_local_env_check_card(frame, app, top_chunks[3], theme, card_border);
-
-    let hero_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(chunks[1].height.saturating_sub(1)),
-            Constraint::Length(1),
-        ])
-        .split(chunks[1]);
+    render_connection_card(frame, top_chunks[0], theme, &connection_lines, card_border);
+    render_local_env_check_card(frame, app, top_chunks[1], theme, card_border);
+    render_home_usage_chart(frame, app, data, top_chunks[2], theme, card_border);
 
     if current_app_routed {
         render_proxy_activity_dashboard(
             frame,
-            hero_chunks[0],
+            chunks[1],
             theme,
             &app.proxy_input_activity_samples,
             &app.proxy_output_activity_samples,
@@ -295,25 +313,43 @@ pub(super) fn render_main(
             &proxy_last_error_text,
             data.proxy.last_error.is_some(),
             &format!("{}:{}", data.proxy.listen_address, data.proxy.listen_port),
+            data.proxy.auto_failover_enabled,
+            auto_failover_queue_len,
             data.proxy.estimated_input_tokens_total,
             data.proxy.estimated_output_tokens_total,
         );
-    } else {
-        render_logo_hero(frame, hero_chunks[0], theme);
     }
-
-    frame.render_widget(
-        Paragraph::new(Line::raw(texts::tui_main_hint()))
-            .alignment(Alignment::Center)
-            .style(
-                Style::default()
-                    .fg(theme.surface)
-                    .add_modifier(Modifier::ITALIC),
-            ),
-        hero_chunks[1],
-    );
 }
 
+/// Section separator used by the home cards; ASCII mode drops the middle dot.
+fn home_separator() -> &'static str {
+    if icons::use_emoji() {
+        " · "
+    } else {
+        " - "
+    }
+}
+
+fn webdav_ok_glyph() -> &'static str {
+    if icons::use_emoji() {
+        "✓"
+    } else {
+        "+"
+    }
+}
+
+fn webdav_neutral_glyph() -> &'static str {
+    if icons::use_emoji() {
+        "•"
+    } else {
+        "*"
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "dashboard renderer receives precomputed proxy display metrics"
+)]
 fn render_proxy_activity_dashboard(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -324,6 +360,8 @@ fn render_proxy_activity_dashboard(
     proxy_last_error_text: &str,
     has_proxy_error: bool,
     listen_text: &str,
+    auto_failover_enabled: bool,
+    auto_failover_queue_len: usize,
     input_tokens_total: u64,
     output_tokens_total: u64,
 ) -> Rect {
@@ -387,6 +425,23 @@ fn render_proxy_activity_dashboard(
         uptime_text,
         Style::default().fg(theme.cyan),
     );
+    if auto_failover_enabled {
+        let auto_failover_value = if auto_failover_queue_len > 0 {
+            format!(
+                "{} · {} {}",
+                crate::t!("enabled", "开启"),
+                crate::t!("Queue", "队列"),
+                auto_failover_queue_len
+            )
+        } else {
+            crate::t!("enabled", "开启").to_string()
+        };
+        push_segment(
+            crate::t!("Automatic failover", "自动故障转移"),
+            auto_failover_value.as_str(),
+            Style::default().fg(theme.ok),
+        );
+    }
     if has_proxy_error {
         push_segment(
             texts::tui_label_last_proxy_error(),
@@ -461,37 +516,16 @@ fn wrapped_display_line_count(text: &str, width: u16) -> u16 {
         return 1;
     }
 
-    UnicodeWidthStr::width(text).max(1).div_ceil(width as usize) as u16
+    // Clamped in `usize`: the cast is the last step, never the first.
+    UnicodeWidthStr::width(text)
+        .max(1)
+        .div_ceil(width as usize)
+        .min(u16::MAX as usize) as u16
 }
 
-fn render_logo_hero(frame: &mut Frame<'_>, area: Rect, theme: &super::theme::Theme) {
-    let logo_lines = logo_hero_lines(theme);
-    let logo_height = (logo_lines.len() as u16).min(area.height);
-    let logo_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(0),
-            Constraint::Length(logo_height),
-            Constraint::Min(0),
-        ])
-        .split(area);
-
-    frame.render_widget(
-        Paragraph::new(logo_lines)
-            .alignment(Alignment::Center)
-            .wrap(Wrap { trim: false }),
-        logo_chunks[1],
-    );
-}
-
-fn logo_hero_lines(theme: &super::theme::Theme) -> Vec<Line<'static>> {
-    let logo_style = Style::default().fg(theme.surface);
-    texts::tui_home_ascii_logo()
-        .lines()
-        .map(|s| Line::from(Span::styled(s.to_string(), logo_style)))
-        .collect::<Vec<_>>()
-}
-
+/// The connection card draws exactly the lines it is given, one row each — the
+/// caller has already clipped them to the card's content width, and the card's
+/// height was derived from that same count.
 fn render_connection_card(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -500,36 +534,13 @@ fn render_connection_card(
     card_border: Style,
 ) {
     frame.render_widget(
-        Paragraph::new(connection_lines.to_vec())
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Plain)
-                    .border_style(card_border)
-                    .title(format!(" {} ", texts::tui_home_section_connection())),
-            )
-            .wrap(Wrap { trim: false }),
-        area,
-    );
-}
-
-fn render_webdav_card(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    _theme: &super::theme::Theme,
-    webdav_lines: &[Line<'_>],
-    card_border: Style,
-) {
-    frame.render_widget(
-        Paragraph::new(webdav_lines.to_vec())
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Plain)
-                    .border_style(card_border)
-                    .title(format!(" {} ", texts::tui_home_section_webdav())),
-            )
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(connection_lines.to_vec()).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Plain)
+                .border_style(card_border)
+                .title(format!(" {} ", texts::tui_home_section_connection())),
+        ),
         area,
     );
 }
@@ -541,7 +552,7 @@ fn render_local_env_check_card(
     theme: &super::theme::Theme,
     card_border: Style,
 ) {
-    use crate::services::local_env_check::{LocalTool, ToolCheckStatus};
+    use crate::services::local_env_check::LocalTool;
 
     let outer = Block::default()
         .borders(Borders::ALL)
@@ -553,113 +564,141 @@ fn render_local_env_check_card(
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Length(2)])
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(2),
+            Constraint::Length(2),
+        ])
         .split(inner);
 
-    let cols0 = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(rows[0]);
-    let cols1 = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(rows[1]);
+    let row_columns = rows
+        .iter()
+        .map(|row| {
+            Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(*row)
+        })
+        .collect::<Vec<_>>();
 
-    let cells = [
-        (LocalTool::Claude, "Claude", cols0[0]),
-        (LocalTool::Codex, "Codex", cols0[1]),
-        (LocalTool::Gemini, "Gemini", cols1[0]),
-        (LocalTool::OpenCode, "OpenCode", cols1[1]),
-    ];
+    let cell_areas = row_columns
+        .iter()
+        .flat_map(|columns| columns.iter().copied())
+        .collect::<Vec<_>>();
+
+    let cells = LocalTool::all()
+        .iter()
+        .zip(cell_areas)
+        .map(|(tool, cell_area)| (*tool, tool.display_name(), cell_area));
 
     for (tool, display_name, cell_area) in cells {
-        let status = if app.local_env_loading {
-            None
-        } else {
-            app.local_env_results
-                .iter()
-                .find(|r| r.tool == tool)
-                .map(|r| &r.status)
-        };
-
-        let (icon, icon_style) = if app.local_env_loading {
-            ("…", Style::default().fg(theme.surface))
-        } else {
-            match status {
-                Some(ToolCheckStatus::Ok { .. }) => (
-                    "✓",
-                    if theme.no_color {
-                        Style::default()
-                    } else {
-                        Style::default().fg(theme.ok)
-                    },
-                ),
-                Some(ToolCheckStatus::NotInstalledOrNotExecutable) | None => (
-                    "!",
-                    if theme.no_color {
-                        Style::default()
-                    } else {
-                        Style::default().fg(theme.warn)
-                    },
-                ),
-                Some(ToolCheckStatus::Error { .. }) => (
-                    "!",
-                    if theme.no_color {
-                        Style::default()
-                    } else {
-                        Style::default().fg(theme.warn)
-                    },
-                ),
-            }
-        };
-
-        let name_style = if theme.no_color {
-            Style::default().add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD)
-        };
-
-        let detail_style = if theme.no_color {
-            Style::default()
-        } else {
-            Style::default().fg(theme.surface)
-        };
-
-        let value_style = Style::default().fg(theme.cyan);
-        let (detail_text, detail_line_style) = if app.local_env_loading {
-            ("".to_string(), detail_style)
-        } else {
-            match status {
-                Some(ToolCheckStatus::Ok { version }) => (version.clone(), value_style),
-                Some(ToolCheckStatus::NotInstalledOrNotExecutable) | None => (
-                    texts::tui_local_env_not_installed().to_string(),
-                    detail_style,
-                ),
-                Some(ToolCheckStatus::Error { message }) => (message.clone(), detail_style),
-            }
-        };
-
-        let detail_width = cell_area.width.saturating_sub(1);
-        let detail_text = truncate_to_display_width(&detail_text, detail_width);
-
-        let lines = vec![
-            Line::from(vec![
-                Span::raw(" "),
-                Span::styled(">_ ", Style::default().fg(theme.surface)),
-                Span::styled(display_name.to_string(), name_style),
-                Span::raw(" "),
-                Span::styled(icon.to_string(), icon_style),
-            ]),
-            Line::from(vec![
-                Span::raw(" "),
-                Span::styled(detail_text, detail_line_style),
-            ]),
-        ];
-
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), cell_area);
+        render_local_env_tool_cell(frame, app, theme, tool, display_name, cell_area);
     }
+}
+
+fn render_local_env_tool_cell(
+    frame: &mut Frame<'_>,
+    app: &App,
+    theme: &super::theme::Theme,
+    tool: crate::services::local_env_check::LocalTool,
+    display_name: &str,
+    cell_area: Rect,
+) {
+    use crate::services::local_env_check::ToolCheckStatus;
+
+    let pending = app.is_local_env_pending(tool);
+    let status = app
+        .local_env_results
+        .iter()
+        .find(|result| result.tool == tool)
+        .map(|result| &result.status);
+
+    let (icon, icon_style) = if pending {
+        (
+            spinner_frame(app.tick),
+            if theme.no_color {
+                Style::default()
+            } else {
+                Style::default().fg(theme.cyan)
+            },
+        )
+    } else {
+        match status {
+            Some(ToolCheckStatus::Ok { .. }) => (
+                "✓",
+                if theme.no_color {
+                    Style::default()
+                } else {
+                    Style::default().fg(theme.ok)
+                },
+            ),
+            Some(ToolCheckStatus::NotInstalledOrNotExecutable) => (
+                "!",
+                if theme.no_color {
+                    Style::default()
+                } else {
+                    Style::default().fg(theme.warn)
+                },
+            ),
+            Some(ToolCheckStatus::VersionUnavailable { .. }) | None => {
+                ("•", Style::default().fg(theme.surface))
+            }
+        }
+    };
+
+    let name_style = if theme.no_color {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(theme.fg_strong)
+            .add_modifier(Modifier::BOLD)
+    };
+
+    let detail_style = if theme.no_color {
+        Style::default()
+    } else {
+        Style::default().fg(theme.surface)
+    };
+
+    let value_style = Style::default().fg(theme.cyan);
+    let (detail_text, detail_line_style) = if pending {
+        (texts::tui_local_env_checking().to_string(), detail_style)
+    } else {
+        match status {
+            Some(ToolCheckStatus::Ok { version }) => (version.clone(), value_style),
+            Some(ToolCheckStatus::NotInstalledOrNotExecutable) => (
+                texts::tui_local_env_not_installed().to_string(),
+                detail_style,
+            ),
+            Some(ToolCheckStatus::VersionUnavailable { .. }) => (
+                texts::tui_local_env_version_unavailable().to_string(),
+                detail_style,
+            ),
+            None => (
+                texts::tui_local_env_check_unavailable().to_string(),
+                detail_style,
+            ),
+        }
+    };
+
+    let detail_width = cell_area.width.saturating_sub(1);
+    let detail_text = truncate_to_display_width(&detail_text, detail_width);
+
+    let lines = vec![
+        Line::from(vec![
+            Span::raw(" "),
+            Span::styled(">_ ", Style::default().fg(theme.surface)),
+            Span::styled(display_name.to_string(), name_style),
+            Span::raw(" "),
+            Span::styled(icon.to_string(), icon_style),
+        ]),
+        Line::from(vec![
+            Span::raw(" "),
+            Span::styled(detail_text, detail_line_style),
+        ]),
+    ];
+
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), cell_area);
 }
 
 #[cfg(test)]

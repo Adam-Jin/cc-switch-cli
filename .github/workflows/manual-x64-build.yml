@@ -1,0 +1,111 @@
+name: Manual x64 Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: manual-x64-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_VERSION: 1.91.1
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux-x64:
+    name: Linux x64
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: manual-linux-x64
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            libssl-dev
+
+      - name: Build
+        working-directory: src-tauri
+        run: cargo build --release --locked --target x86_64-unknown-linux-gnu
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist staging
+          cp src-tauri/target/x86_64-unknown-linux-gnu/release/cc-switch staging/cc-switch
+          chmod +x staging/cc-switch
+          tar -C staging -czf dist/cc-switch-cli-linux-x64.tar.gz cc-switch
+          sha256sum dist/cc-switch-cli-linux-x64.tar.gz \
+            > dist/cc-switch-cli-linux-x64.tar.gz.sha256
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cc-switch-cli-linux-x64-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  windows-x64:
+    name: Windows x64
+    runs-on: windows-2022
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: x86_64-pc-windows-msvc
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: manual-windows-x64
+
+      - name: Build
+        working-directory: src-tauri
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path dist, staging | Out-Null
+          Copy-Item src-tauri/target/x86_64-pc-windows-msvc/release/cc-switch.exe staging/cc-switch.exe
+          Compress-Archive -Path staging/cc-switch.exe -DestinationPath dist/cc-switch-cli-windows-x64.zip -Force
+          $hash = (Get-FileHash dist/cc-switch-cli-windows-x64.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  cc-switch-cli-windows-x64.zip" | Set-Content dist/cc-switch-cli-windows-x64.zip.sha256
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cc-switch-cli-windows-x64-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14

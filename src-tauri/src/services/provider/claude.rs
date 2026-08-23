@@ -1,32 +1,6 @@
 use super::*;
 
 impl ProviderService {
-    pub(super) fn parse_common_claude_config_snippet(snippet: &str) -> Result<Value, AppError> {
-        let value: Value = serde_json::from_str(snippet).map_err(|e| {
-            AppError::localized(
-                "common_config.claude.invalid_json",
-                format!("Claude 通用配置片段不是有效的 JSON：{e}"),
-                format!("Claude common config snippet is not valid JSON: {e}"),
-            )
-        })?;
-        if !value.is_object() {
-            return Err(AppError::localized(
-                "common_config.claude.not_object",
-                "Claude 通用配置片段必须是 JSON 对象",
-                "Claude common config snippet must be a JSON object",
-            ));
-        }
-        Ok(value)
-    }
-
-    pub(super) fn parse_common_claude_config_snippet_for_strip(
-        snippet: &str,
-    ) -> Result<Value, AppError> {
-        let mut value = Self::parse_common_claude_config_snippet(snippet)?;
-        let _ = Self::normalize_claude_models_in_value(&mut value);
-        Ok(value)
-    }
-
     /// 归一化 Claude 模型键：读旧键(ANTHROPIC_SMALL_FAST_MODEL)，写新键(DEFAULT_*), 并删除旧键
     pub(crate) fn normalize_claude_models_in_value(settings: &mut Value) -> bool {
         let mut changed = false;
@@ -108,6 +82,7 @@ impl ProviderService {
         }
     }
 
+    #[allow(dead_code)]
     pub(super) fn strip_common_claude_config_from_provider(
         provider: &mut Provider,
         common_config_snippet: Option<&str>,
@@ -201,7 +176,7 @@ impl ProviderService {
         };
 
         for provider in manager.providers.values_mut() {
-            common_config::normalize_provider_common_config_for_storage(
+            common_config::migrate_provider_subset_usage_for_storage(
                 &AppType::Claude,
                 provider,
                 Some(old_snippet),
@@ -211,24 +186,66 @@ impl ProviderService {
         Ok(())
     }
 
-    pub(super) fn write_claude_live(
+    pub(crate) fn write_claude_live_force(
         provider: &Provider,
         common_config_snippet: Option<&str>,
         apply_common_config: bool,
     ) -> Result<(), AppError> {
-        if !crate::sync_policy::should_sync_live(&AppType::Claude) {
-            return Ok(());
+        let prepared = Self::prepare_claude_live_write(
+            provider,
+            common_config_snippet,
+            None,
+            apply_common_config,
+            true,
+        )?;
+        Self::apply_claude_live_write(&prepared)
+    }
+
+    pub(super) fn prepare_claude_live_write(
+        provider: &Provider,
+        common_config_snippet: Option<&str>,
+        _previous_common_config_snippet: Option<&str>,
+        apply_common_config: bool,
+        force_sync: bool,
+    ) -> Result<PreparedLiveWrite, AppError> {
+        if !force_sync && !crate::sync_policy::should_sync_live(&AppType::Claude) {
+            return Ok(PreparedLiveWrite::Noop);
         }
 
-        let settings_path = get_claude_settings_path();
-        let content_to_write = Self::build_effective_live_snapshot(
+        // Upstream parity (sync_claude_live): build the provider's effective
+        // settings (provider config + common-config snippet) and OVERWRITE
+        // settings.json. Non-provider fields survive via the common-config
+        // snippet, not via a merge with the existing live file.
+        let mut settings = Self::build_effective_live_snapshot(
             &AppType::Claude,
             provider,
             common_config_snippet,
             apply_common_config,
         )?;
+        // Upstream parity (sanitize_claude_settings_for_live): CC-Switch's
+        // internal-only fields must never be written into Claude Code's
+        // settings.json. The stored provider snapshot keeps them (meta /
+        // settings_config), so this only strips them from the live file.
+        Self::sanitize_claude_settings_for_live(&mut settings);
 
-        write_json_file(&settings_path, &content_to_write)?;
-        Ok(())
+        Ok(PreparedLiveWrite::Claude { settings })
+    }
+
+    /// Mirror of upstream `sanitize_claude_settings_for_live`: remove CC-Switch
+    /// internal-only fields that must not leak into Claude Code's settings.json.
+    fn sanitize_claude_settings_for_live(settings: &mut Value) {
+        if let Some(obj) = settings.as_object_mut() {
+            obj.remove("api_format");
+            obj.remove("apiFormat");
+            obj.remove("openrouter_compat_mode");
+            obj.remove("openrouterCompatMode");
+        }
+    }
+
+    pub(super) fn apply_claude_live_write(prepared: &PreparedLiveWrite) -> Result<(), AppError> {
+        let PreparedLiveWrite::Claude { settings } = prepared else {
+            return Ok(());
+        };
+        write_json_file(&get_claude_settings_path(), settings)
     }
 }

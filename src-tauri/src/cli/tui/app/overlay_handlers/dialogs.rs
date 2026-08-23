@@ -6,6 +6,10 @@ impl App {
         key: KeyEvent,
         data: &UiData,
     ) -> Option<Action> {
+        if let Some(action) = self.handle_codex_history_confirm_key(key) {
+            return Some(action);
+        }
+
         if let Some(action) = self.handle_confirm_overlay_key(key, data) {
             return Some(action);
         }
@@ -15,6 +19,57 @@ impl App {
         }
 
         None
+    }
+
+    fn handle_codex_history_confirm_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let Overlay::CodexHistoryConfirm(confirm) = &mut self.overlay else {
+            return None;
+        };
+
+        let action = match (confirm.mode, key.code) {
+            (CodexHistoryConfirmMode::Enable, KeyCode::Enter) => {
+                self.close_overlay();
+                Action::SetCodexUnifiedSessionHistory {
+                    enabled: true,
+                    migrate_existing: false,
+                    restore_after_disable: false,
+                }
+            }
+            (CodexHistoryConfirmMode::Enable, KeyCode::Char('y') | KeyCode::Char('Y')) => {
+                self.close_overlay();
+                Action::SetCodexUnifiedSessionHistory {
+                    enabled: true,
+                    migrate_existing: true,
+                    restore_after_disable: false,
+                }
+            }
+            (
+                CodexHistoryConfirmMode::Disable,
+                KeyCode::Char(' ') | KeyCode::Char('x') | KeyCode::Char('X'),
+            ) if confirm.show_restore_checkbox => {
+                confirm.restore_checked = !confirm.restore_checked;
+                Action::None
+            }
+            (
+                CodexHistoryConfirmMode::Disable,
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter,
+            ) => {
+                let restore = confirm.show_restore_checkbox && confirm.restore_checked;
+                self.close_overlay();
+                Action::SetCodexUnifiedSessionHistory {
+                    enabled: false,
+                    migrate_existing: false,
+                    restore_after_disable: restore,
+                }
+            }
+            (_, KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc) => {
+                self.close_overlay();
+                Action::None
+            }
+            _ => Action::None,
+        };
+
+        Some(action)
     }
 
     fn handle_confirm_overlay_key(&mut self, key: KeyEvent, data: &UiData) -> Option<Action> {
@@ -30,8 +85,32 @@ impl App {
                     ConfirmAction::ProviderDelete { id } => {
                         Action::ProviderDelete { id: id.clone() }
                     }
+                    ConfirmAction::ProviderCopy { id } => {
+                        if let Some(row) = data.providers.rows.iter().find(|r| &r.id == id) {
+                            self.open_provider_copy_form(row, data);
+                        }
+                        // No action as we open a new form immediately
+                        return Some(Action::None);
+                    }
+                    ConfirmAction::ProviderRemoveFromConfig { id } => {
+                        Action::ProviderRemoveFromConfig { id: id.clone() }
+                    }
                     ConfirmAction::McpDelete { id } => Action::McpDelete { id: id.clone() },
                     ConfirmAction::PromptDelete { id } => Action::PromptDelete { id: id.clone() },
+                    ConfirmAction::PricingDelete { model_id } => Action::PricingDelete {
+                        model_id: model_id.clone(),
+                    },
+                    ConfirmAction::SessionDelete {
+                        key,
+                        provider_id,
+                        session_id,
+                        source_path,
+                    } => Action::SessionDelete {
+                        key: key.clone(),
+                        provider_id: provider_id.clone(),
+                        session_id: session_id.clone(),
+                        source_path: source_path.clone(),
+                    },
                     ConfirmAction::SkillsUninstall { directory } => Action::SkillsUninstall {
                         directory: directory.clone(),
                     },
@@ -52,7 +131,39 @@ impl App {
                     ConfirmAction::SettingsSetClaudePluginIntegration { enabled } => {
                         Action::SetClaudePluginIntegration { enabled: *enabled }
                     }
+                    ConfirmAction::SettingsSetGlobalOutboundProxy { config } => {
+                        Action::SetGlobalOutboundProxy {
+                            config: config.clone(),
+                        }
+                    }
+                    ConfirmAction::VisibleAppsAutoDetection => {
+                        Action::ConfirmVisibleAppsAutoDetection { use_auto: true }
+                    }
+                    ConfirmAction::VisibleAppsSwitchToManual { apps, selected } => {
+                        Action::SwitchVisibleAppsToManual {
+                            apps: apps.clone(),
+                            selected: *selected,
+                        }
+                    }
                     ConfirmAction::ProviderApiFormatProxyNotice => Action::None,
+                    ConfirmAction::CommonConfigNotice => Action::ConfirmCommonConfigNotice,
+                    ConfirmAction::UsageQueryNotice => Action::ConfirmUsageQueryNotice,
+                    ConfirmAction::RebuildCodexUsage => Action::UsageRebuildCodex,
+                    ConfirmAction::ManagedAuthCancelLogin => {
+                        self.cancel_managed_auth_login();
+                        Action::None
+                    }
+                    ConfirmAction::ProxyEnableAndAutoFailover { app_type } => {
+                        Action::EnableProxyAndAutoFailover {
+                            app_type: app_type.clone(),
+                        }
+                    }
+                    ConfirmAction::PromptOpenImportCandidate { filename, content } => {
+                        Action::PromptOpenImportCandidate {
+                            filename: filename.clone(),
+                            content: content.clone(),
+                        }
+                    }
                     ConfirmAction::OpenClawDailyMemoryDelete { filename } => {
                         Action::OpenClawDailyMemoryDelete {
                             filename: filename.clone(),
@@ -71,11 +182,73 @@ impl App {
                         }
                     }
                     ConfirmAction::WebDavMigrateV1ToV2 => Action::ConfigWebDavMigrateV1ToV2,
+                    ConfirmAction::CloudSyncTransfer { backend, intent } => {
+                        match (backend, intent) {
+                            (CloudSyncBackend::WebDav, CloudSyncTransferIntent::Upload) => {
+                                Action::ConfigWebDavUpload
+                            }
+                            (CloudSyncBackend::WebDav, CloudSyncTransferIntent::Restore) => {
+                                Action::ConfigWebDavDownload
+                            }
+                            (CloudSyncBackend::S3Compatible, CloudSyncTransferIntent::Upload) => {
+                                Action::ConfigS3Upload
+                            }
+                            (CloudSyncBackend::S3Compatible, CloudSyncTransferIntent::Restore) => {
+                                Action::ConfigS3Download
+                            }
+                        }
+                    }
+                    ConfirmAction::CloudSyncReset { backend } => match backend {
+                        CloudSyncBackend::WebDav => Action::ConfigWebDavReset,
+                        CloudSyncBackend::S3Compatible => Action::ConfigS3Reset,
+                    },
+                    ConfirmAction::ClaudeModelFillAll { source_idx } => {
+                        let source_idx = *source_idx;
+                        if let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() {
+                            provider.fill_claude_models_from(source_idx);
+                        }
+                        self.overlay = Overlay::ClaudeModelPicker {
+                            selected: source_idx,
+                            column: ClaudeModelPickerColumn::Model,
+                            editing: false,
+                        };
+                        return Some(Action::None);
+                    }
                 };
                 self.close_overlay();
                 action
             }
             KeyCode::Char('n') | KeyCode::Char('N') => {
+                if let ConfirmAction::ClaudeModelFillAll { source_idx } = confirm.action {
+                    self.overlay = Overlay::ClaudeModelPicker {
+                        selected: source_idx,
+                        column: ClaudeModelPickerColumn::Model,
+                        editing: false,
+                    };
+                    return Some(Action::None);
+                }
+                if matches!(confirm.action, ConfirmAction::VisibleAppsAutoDetection) {
+                    self.close_overlay();
+                    return Some(Action::ConfirmVisibleAppsAutoDetection { use_auto: false });
+                }
+                if let ConfirmAction::VisibleAppsSwitchToManual { selected, .. } = &confirm.action {
+                    self.overlay = Overlay::VisibleAppsPicker {
+                        selected: *selected,
+                        apps: crate::settings::get_visible_apps(),
+                    };
+                    return Some(Action::None);
+                }
+                if matches!(
+                    confirm.action,
+                    ConfirmAction::CommonConfigNotice | ConfirmAction::UsageQueryNotice
+                ) {
+                    self.close_overlay();
+                    return Some(match confirm.action {
+                        ConfirmAction::CommonConfigNotice => Action::ConfirmCommonConfigNotice,
+                        ConfirmAction::UsageQueryNotice => Action::ConfirmUsageQueryNotice,
+                        _ => Action::None,
+                    });
+                }
                 if matches!(confirm.action, ConfirmAction::EditorSaveBeforeClose) {
                     self.editor = None;
                 }
@@ -87,7 +260,29 @@ impl App {
             }
             KeyCode::Esc => {
                 self.close_overlay();
-                Action::None
+                match confirm.action {
+                    ConfirmAction::CommonConfigNotice => Action::ConfirmCommonConfigNotice,
+                    ConfirmAction::UsageQueryNotice => Action::ConfirmUsageQueryNotice,
+                    ConfirmAction::VisibleAppsAutoDetection => {
+                        Action::ConfirmVisibleAppsAutoDetection { use_auto: false }
+                    }
+                    ConfirmAction::VisibleAppsSwitchToManual { selected, .. } => {
+                        self.overlay = Overlay::VisibleAppsPicker {
+                            selected,
+                            apps: crate::settings::get_visible_apps(),
+                        };
+                        Action::None
+                    }
+                    ConfirmAction::ClaudeModelFillAll { source_idx } => {
+                        self.overlay = Overlay::ClaudeModelPicker {
+                            selected: source_idx,
+                            column: ClaudeModelPickerColumn::Model,
+                            editing: false,
+                        };
+                        Action::None
+                    }
+                    _ => Action::None,
+                }
             }
             _ => Action::None,
         };
@@ -145,42 +340,6 @@ impl App {
                 }
                 Action::ConfigExport { path: raw }
             }
-            TextSubmit::PromptCreateName => {
-                let trimmed = raw.trim().to_string();
-                if trimmed.is_empty() {
-                    self.push_toast(texts::tui_toast_prompt_name_empty(), ToastKind::Warning);
-                    self.overlay = Overlay::TextInput(TextInputState {
-                        title: texts::tui_prompt_create_title().to_string(),
-                        prompt: texts::tui_prompt_create_prompt().to_string(),
-                        input: TextInput::new(raw),
-                        submit: TextSubmit::PromptCreateName,
-                        secret: false,
-                    });
-                    return Action::None;
-                }
-                self.open_editor(
-                    texts::tui_prompt_title(&trimmed),
-                    EditorKind::Plain,
-                    "# Write your prompt here\n",
-                    EditorSubmit::PromptCreate { name: trimmed },
-                );
-                Action::None
-            }
-            TextSubmit::PromptRename { id } => {
-                let trimmed = raw.trim().to_string();
-                if trimmed.is_empty() {
-                    self.push_toast(texts::tui_toast_prompt_name_empty(), ToastKind::Warning);
-                    self.overlay = Overlay::TextInput(TextInputState {
-                        title: texts::tui_prompt_rename_title().to_string(),
-                        prompt: texts::tui_prompt_rename_prompt().to_string(),
-                        input: TextInput::new(raw),
-                        submit: TextSubmit::PromptRename { id },
-                        secret: false,
-                    });
-                    return Action::None;
-                }
-                Action::PromptRename { id, name: trimmed }
-            }
             TextSubmit::ConfigImport => {
                 if raw.is_empty() {
                     self.push_toast(texts::tui_toast_import_path_empty(), ToastKind::Warning);
@@ -203,6 +362,60 @@ impl App {
             TextSubmit::SettingsProxyListenPort => {
                 self.handle_settings_proxy_listen_port_submit(data, raw)
             }
+            TextSubmit::SettingsOutboundProxyUrl => {
+                let trimmed = raw.trim().to_string();
+                let mut config = self
+                    .global_outbound_proxy_draft
+                    .clone()
+                    .or_else(|| data.config.global_outbound_proxy.clone())
+                    .unwrap_or_default();
+                if trimmed.is_empty() {
+                    config = crate::services::GlobalOutboundProxyConfig::default();
+                } else {
+                    let submitted_auth = url::Url::parse(&trimmed)
+                        .ok()
+                        .filter(|url| !url.username().is_empty() || url.password().is_some())
+                        .and_then(|_| {
+                            crate::services::GlobalOutboundProxyConfig::from_full_url(&trimmed).ok()
+                        });
+                    if let Some(submitted) = submitted_auth {
+                        config = submitted;
+                    } else {
+                        config.url = trimmed;
+                    }
+                }
+                self.validate_and_save_global_outbound_proxy(
+                    TextSubmit::SettingsOutboundProxyUrl,
+                    raw,
+                    config,
+                )
+            }
+            TextSubmit::SettingsOutboundProxyUsername => {
+                let mut config = self
+                    .global_outbound_proxy_draft
+                    .clone()
+                    .or_else(|| data.config.global_outbound_proxy.clone())
+                    .unwrap_or_default();
+                config.username = raw.clone();
+                self.validate_and_save_global_outbound_proxy(
+                    TextSubmit::SettingsOutboundProxyUsername,
+                    raw,
+                    config,
+                )
+            }
+            TextSubmit::SettingsOutboundProxyPassword => {
+                let mut config = self
+                    .global_outbound_proxy_draft
+                    .clone()
+                    .or_else(|| data.config.global_outbound_proxy.clone())
+                    .unwrap_or_default();
+                config.password = raw.clone();
+                self.validate_and_save_global_outbound_proxy(
+                    TextSubmit::SettingsOutboundProxyPassword,
+                    raw,
+                    config,
+                )
+            }
             TextSubmit::SettingsOpenClawConfigDir => {
                 let trimmed = raw.trim().to_string();
                 let path = if trimmed.is_empty() {
@@ -211,6 +424,27 @@ impl App {
                     Some(trimmed)
                 };
                 Action::SetOpenClawConfigDir { path }
+            }
+            TextSubmit::SettingsPreferredEditor => {
+                let trimmed = raw.trim().to_string();
+                let command = if trimmed.is_empty() {
+                    None
+                } else {
+                    if let Err(err) =
+                        crate::cli::editor::validate_preferred_editor_command(&trimmed)
+                    {
+                        self.overlay = Overlay::TextInput(TextInputState {
+                            title: texts::tui_settings_preferred_editor_label().to_string(),
+                            prompt: texts::tui_settings_preferred_editor_prompt().to_string(),
+                            input: TextInput::new(trimmed),
+                            submit: TextSubmit::SettingsPreferredEditor,
+                        });
+                        self.push_toast(err.to_string(), ToastKind::Error);
+                        return Action::None;
+                    }
+                    Some(trimmed)
+                };
+                Action::SetPreferredEditor { command }
             }
             TextSubmit::SkillsInstallSpec => {
                 if raw.is_empty() {
@@ -221,7 +455,11 @@ impl App {
             }
             TextSubmit::SkillsDiscoverQuery => {
                 self.skills_discover_query = raw.clone();
-                Action::SkillsDiscover { query: raw }
+                Action::SkillsDiscover {
+                    query: raw,
+                    source: self.skills_discover_source,
+                    force: false,
+                }
             }
             TextSubmit::SkillsRepoAdd => {
                 if raw.is_empty() {
@@ -250,9 +488,122 @@ impl App {
             TextSubmit::OpenClawToolsRule { section, row } => {
                 self.handle_openclaw_tools_rule_submit(section, row, raw, data)
             }
+            TextSubmit::UsageCustomRange => match data::parse_usage_custom_range(&raw) {
+                Ok(range) => Action::UsageCustomRange { range },
+                Err(err) => {
+                    self.push_toast(format!("Invalid custom range: {err}"), ToastKind::Warning);
+                    self.overlay = Overlay::TextInput(TextInputState {
+                        title: if crate::cli::i18n::is_chinese() {
+                            "自定义时间区间".to_string()
+                        } else {
+                            "Custom Range".to_string()
+                        },
+                        prompt: if crate::cli::i18n::is_chinese() {
+                            "格式：YYYY-MM-DD..YYYY-MM-DD".to_string()
+                        } else {
+                            "Format: YYYY-MM-DD..YYYY-MM-DD".to_string()
+                        },
+                        input: TextInput::new(raw),
+                        submit: TextSubmit::UsageCustomRange,
+                    });
+                    Action::None
+                }
+            },
+            TextSubmit::ProviderCustomUserAgent => {
+                if let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() {
+                    provider.custom_user_agent.set(raw);
+                }
+                Action::None
+            }
+            TextSubmit::CodexModelCatalogField { row, field } => {
+                self.handle_codex_model_catalog_field_submit(row, field, raw)
+            }
             TextSubmit::WebDavJianguoyunUsername => self.handle_webdav_username_submit(raw),
             TextSubmit::WebDavJianguoyunPassword => self.handle_webdav_password_submit(raw),
+            TextSubmit::McpMachineSelector { id } => Action::McpSetMachineSelector {
+                id,
+                selector: crate::app_config::MachineSelector::parse_edit_string(&raw),
+            },
+            TextSubmit::SkillsMachineSelector { directory } => Action::SkillsSetMachineSelector {
+                directory,
+                selector: crate::app_config::MachineSelector::parse_edit_string(&raw),
+            },
+            TextSubmit::MachineLabels => Action::MachineLabelsSet {
+                labels: raw
+                    .split([' ', ',', '\t'])
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect(),
+            },
         }
+    }
+
+    fn validate_and_save_global_outbound_proxy(
+        &mut self,
+        submit: TextSubmit,
+        raw: String,
+        config: crate::services::GlobalOutboundProxyConfig,
+    ) -> Action {
+        let credential_without_url = config.url.trim().is_empty()
+            && matches!(
+                submit,
+                TextSubmit::SettingsOutboundProxyUsername
+                    | TextSubmit::SettingsOutboundProxyPassword
+            );
+        if credential_without_url {
+            if !config.url.trim().is_empty() {
+                let url_only = crate::services::GlobalOutboundProxyConfig {
+                    url: config.url.clone(),
+                    ..Default::default()
+                };
+                if let Err(error) = url_only.to_full_url() {
+                    self.overlay =
+                        Overlay::TextInput(global_outbound_proxy_text_input(submit, raw));
+                    self.push_toast(global_outbound_proxy_error_message(error), ToastKind::Error);
+                    return Action::None;
+                }
+            }
+            self.global_outbound_proxy_draft = Some(config);
+            return Action::None;
+        }
+
+        if let Err(error) = config.to_full_url() {
+            self.overlay = Overlay::TextInput(global_outbound_proxy_text_input(submit, raw));
+            self.push_toast(global_outbound_proxy_error_message(error), ToastKind::Error);
+            return Action::None;
+        }
+
+        self.save_global_outbound_proxy(config)
+    }
+
+    fn handle_codex_model_catalog_field_submit(
+        &mut self,
+        row: Option<usize>,
+        field: form::CodexModelCatalogField,
+        raw: String,
+    ) -> Action {
+        let trimmed = raw.trim().to_string();
+        if matches!(field, form::CodexModelCatalogField::Model) && trimmed.is_empty() {
+            self.push_toast(
+                texts::tui_toast_provider_add_missing_fields(),
+                ToastKind::Warning,
+            );
+            self.overlay = Overlay::TextInput(TextInputState {
+                title: texts::tui_codex_model_catalog().to_string(),
+                prompt: codex_model_catalog_field_prompt(field).to_string(),
+                input: TextInput::new(trimmed),
+                submit: TextSubmit::CodexModelCatalogField { row, field },
+            });
+            return Action::None;
+        }
+
+        let Some(FormState::ProviderAdd(provider)) = self.form.as_mut() else {
+            return Action::None;
+        };
+        provider.codex_model_catalog_field = field;
+        provider.set_codex_model_catalog_field(row, field, &trimmed);
+        Action::None
     }
 
     fn handle_openclaw_agents_runtime_submit(
@@ -294,7 +645,6 @@ impl App {
                 prompt: texts::tui_webdav_jianguoyun_username_prompt().to_string(),
                 input: TextInput::new(""),
                 submit: TextSubmit::WebDavJianguoyunUsername,
-                secret: false,
             });
             return Action::None;
         }
@@ -305,7 +655,6 @@ impl App {
             prompt: texts::tui_webdav_jianguoyun_app_password_prompt().to_string(),
             input: TextInput::new(""),
             submit: TextSubmit::WebDavJianguoyunPassword,
-            secret: true,
         });
         Action::None
     }
@@ -318,7 +667,6 @@ impl App {
                 prompt: texts::tui_webdav_jianguoyun_app_password_prompt().to_string(),
                 input: TextInput::new(""),
                 submit: TextSubmit::WebDavJianguoyunPassword,
-                secret: true,
             });
             return Action::None;
         }
@@ -342,14 +690,14 @@ impl App {
     ) -> Action {
         if data.proxy.running {
             self.push_toast(
-                texts::tui_toast_proxy_settings_stop_before_edit(),
+                texts::tui_toast_proxy_settings_stop_proxy_before_edit_address(),
                 ToastKind::Info,
             );
             return Action::None;
         }
 
         let trimmed = raw.trim().to_string();
-        if !is_valid_proxy_listen_address(&trimmed) {
+        if !crate::cli::proxy_settings::is_valid_proxy_listen_address(&trimmed) {
             self.push_toast(
                 texts::tui_toast_proxy_listen_address_invalid(),
                 ToastKind::Warning,
@@ -359,7 +707,6 @@ impl App {
                 prompt: texts::tui_settings_proxy_listen_address_prompt().to_string(),
                 input: TextInput::new(trimmed),
                 submit: TextSubmit::SettingsProxyListenAddress,
-                secret: false,
             });
             return Action::None;
         }
@@ -368,9 +715,9 @@ impl App {
     }
 
     fn handle_settings_proxy_listen_port_submit(&mut self, data: &UiData, raw: String) -> Action {
-        if data.proxy.running {
+        if data.proxy.has_active_worker_for(&self.app_type) {
             self.push_toast(
-                texts::tui_toast_proxy_settings_stop_before_edit(),
+                texts::tui_toast_proxy_settings_stop_app_route_before_edit_port(),
                 ToastKind::Info,
             );
             return Action::None;
@@ -387,12 +734,11 @@ impl App {
                 prompt: texts::tui_settings_proxy_listen_port_prompt().to_string(),
                 input: TextInput::new(trimmed),
                 submit: TextSubmit::SettingsProxyListenPort,
-                secret: false,
             });
             return Action::None;
         };
 
-        if !(1024..=65535).contains(&port) {
+        if crate::cli::proxy_settings::validate_proxy_listen_port(port).is_err() {
             self.push_toast(
                 texts::tui_toast_proxy_listen_port_invalid(),
                 ToastKind::Warning,
@@ -402,7 +748,6 @@ impl App {
                 prompt: texts::tui_settings_proxy_listen_port_prompt().to_string(),
                 input: TextInput::new(trimmed),
                 submit: TextSubmit::SettingsProxyListenPort,
-                secret: false,
             });
             return Action::None;
         }
@@ -411,20 +756,14 @@ impl App {
     }
 }
 
-fn is_valid_proxy_listen_address(value: &str) -> bool {
-    if value.is_empty() {
-        return false;
+fn codex_model_catalog_field_prompt(field: form::CodexModelCatalogField) -> &'static str {
+    match field {
+        form::CodexModelCatalogField::Model => texts::tui_codex_model_catalog_model_prompt(),
+        form::CodexModelCatalogField::DisplayName => {
+            texts::tui_codex_model_catalog_display_prompt()
+        }
+        form::CodexModelCatalogField::ContextWindow => {
+            texts::tui_codex_model_catalog_context_prompt()
+        }
     }
-    if matches!(value, "localhost" | "0.0.0.0") {
-        return true;
-    }
-
-    let parts = value.split('.').collect::<Vec<_>>();
-    if parts.len() != 4 {
-        return false;
-    }
-
-    parts
-        .iter()
-        .all(|part| !part.is_empty() && part.parse::<u8>().is_ok())
 }

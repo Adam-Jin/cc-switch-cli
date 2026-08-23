@@ -6,9 +6,8 @@
 use std::time::Duration;
 
 use futures::StreamExt;
-use reqwest::{Client, Method, StatusCode};
+use reqwest::{Method, StatusCode};
 use url::Url;
-use uuid::Uuid;
 
 use crate::error::AppError;
 
@@ -50,7 +49,7 @@ pub fn auth_from_credentials(username: &str, password: &str) -> WebDavAuth {
 // ---------------------------------------------------------------------------
 
 pub fn parse_base_url(raw: &str) -> Result<Url, AppError> {
-    let trimmed = raw.trim().trim_end_matches('/');
+    let trimmed = raw.trim();
     let url = Url::parse(trimmed)
         .map_err(|e| AppError::InvalidInput(format!("WebDAV base_url 不是合法 URL: {e}")))?;
     let scheme = url.scheme();
@@ -161,6 +160,18 @@ pub fn path_segments(raw: &str) -> impl Iterator<Item = &str> {
         .filter(|segment| !segment.is_empty())
 }
 
+fn collection_url(raw: String) -> Result<String, AppError> {
+    let mut url = Url::parse(&raw)
+        .map_err(|e| AppError::InvalidInput(format!("WebDAV 目录 URL 不是合法 URL: {e}")))?;
+    if !url.path().ends_with('/') {
+        url.path_segments_mut()
+            .map_err(|_| AppError::InvalidInput("WebDAV 目录 URL 必须是分层地址".to_string()))?
+            .push("");
+    }
+    Ok(url.to_string())
+}
+
+#[cfg(test)]
 pub fn is_jianguoyun(base_url: &str) -> bool {
     matches!(
         detect_service_from_base_url(base_url),
@@ -178,17 +189,6 @@ fn redact_url(url: &str) -> String {
         }
         Err(_) => url.to_string(),
     }
-}
-
-// ---------------------------------------------------------------------------
-// HTTP 客户端
-// ---------------------------------------------------------------------------
-
-fn build_client(timeout_secs: u64) -> Result<Client, AppError> {
-    Client::builder()
-        .timeout(Duration::from_secs(timeout_secs.max(1)))
-        .build()
-        .map_err(|e| AppError::Message(format!("创建 WebDAV HTTP 客户端失败: {e}")))
 }
 
 fn apply_auth(builder: reqwest::RequestBuilder, auth: &WebDavAuth) -> reqwest::RequestBuilder {
@@ -253,9 +253,12 @@ fn with_service_hint(base_url: &str, message: impl Into<String>) -> String {
 // ---------------------------------------------------------------------------
 
 pub async fn test_connection(base_url: &str, auth: &WebDavAuth) -> Result<(), AppError> {
-    let client = build_client(DEFAULT_TIMEOUT_SECS)?;
+    let client = crate::proxy::http_client::get();
     let method = Method::from_bytes(b"PROPFIND").map_err(|e| AppError::Message(e.to_string()))?;
-    let mut req = client.request(method, base_url).header("Depth", "0");
+    let mut req = client
+        .request(method, base_url)
+        .header("Depth", "0")
+        .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS));
     req = apply_auth(req, auth);
     let resp = req.send().await.map_err(|e| {
         AppError::Message(with_service_hint(
@@ -280,10 +283,11 @@ pub async fn put_bytes(
     content_type: &str,
 ) -> Result<(), AppError> {
     let base_url = url;
-    let client = build_client(TRANSFER_TIMEOUT_SECS)?;
+    let client = crate::proxy::http_client::get();
     let mut req = client
         .put(url)
         .header("Content-Type", content_type)
+        .timeout(Duration::from_secs(TRANSFER_TIMEOUT_SECS))
         .body(bytes);
     req = apply_auth(req, auth);
     let resp = req.send().await.map_err(|e| {
@@ -308,8 +312,10 @@ pub async fn get_bytes(
     max_bytes: Option<u64>,
 ) -> Result<Option<(Vec<u8>, Option<String>)>, AppError> {
     let base_url = url;
-    let client = build_client(TRANSFER_TIMEOUT_SECS)?;
-    let mut req = client.get(url);
+    let client = crate::proxy::http_client::get();
+    let mut req = client
+        .get(url)
+        .timeout(Duration::from_secs(TRANSFER_TIMEOUT_SECS));
     req = apply_auth(req, auth);
     let resp = req.send().await.map_err(|e| {
         AppError::Message(with_service_hint(
@@ -359,45 +365,16 @@ pub async fn get_bytes(
     }
 }
 
-pub async fn verify_readback_matches(
-    base_url: &str,
-    url: &str,
-    auth: &WebDavAuth,
-    expected_bytes: &[u8],
-    resource_name: &str,
-) -> Result<(), AppError> {
-    let max_bytes = u64::try_from(expected_bytes.len()).unwrap_or(u64::MAX);
-    let Some((readback, _)) = get_bytes(url, auth, Some(max_bytes)).await? else {
-        return Err(AppError::Message(with_service_hint(
-            base_url,
-            format!(
-                "WebDAV {resource_name} readback missing after PUT: {}",
-                redact_url(url)
-            ),
-        )));
-    };
-
-    if readback != expected_bytes {
-        return Err(AppError::Message(with_service_hint(
-            base_url,
-            format!(
-                "WebDAV {resource_name} readback mismatch: {}",
-                redact_url(url)
-            ),
-        )));
-    }
-
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // HEAD
 // ---------------------------------------------------------------------------
 
 pub async fn head_etag(url: &str, auth: &WebDavAuth) -> Result<Option<String>, AppError> {
     let base_url = url;
-    let client = build_client(DEFAULT_TIMEOUT_SECS)?;
-    let mut req = client.head(url);
+    let client = crate::proxy::http_client::get();
+    let mut req = client
+        .head(url)
+        .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS));
     req = apply_auth(req, auth);
     let resp = req.send().await.map_err(|e| {
         AppError::Message(with_service_hint(
@@ -434,9 +411,12 @@ async fn propfind_remote_dir(
     auth: &WebDavAuth,
     base_url: &str,
 ) -> Result<RemoteDirProbe, AppError> {
-    let client = build_client(DEFAULT_TIMEOUT_SECS)?;
+    let client = crate::proxy::http_client::get();
     let method = Method::from_bytes(b"PROPFIND").map_err(|e| AppError::Message(e.to_string()))?;
-    let mut req = client.request(method, url).header("Depth", "0");
+    let mut req = client
+        .request(method, url)
+        .header("Depth", "0")
+        .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS));
     req = apply_auth(req, auth);
     let resp = req.send().await.map_err(|e| {
         AppError::Message(with_service_hint(
@@ -459,9 +439,11 @@ async fn mkcol_remote_dir(
     auth: &WebDavAuth,
     base_url: &str,
 ) -> Result<StatusCode, AppError> {
-    let client = build_client(DEFAULT_TIMEOUT_SECS)?;
+    let client = crate::proxy::http_client::get();
     let method = Method::from_bytes(b"MKCOL").map_err(|e| AppError::Message(e.to_string()))?;
-    let mut req = client.request(method, url);
+    let mut req = client
+        .request(method, url)
+        .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS));
     req = apply_auth(req, auth);
     let resp = req.send().await.map_err(|e| {
         AppError::Message(with_service_hint(
@@ -487,8 +469,13 @@ fn should_verify_after_mkcol(status: StatusCode) -> bool {
 /// DELETE a remote collection (directory). Returns Ok(true) if deleted,
 /// Ok(false) if 404/410 (already gone), Err on other failures.
 pub async fn delete_resource(url: &str, auth: &WebDavAuth) -> Result<bool, AppError> {
-    let client = build_client(DEFAULT_TIMEOUT_SECS)?;
-    let req = apply_auth(client.request(Method::DELETE, url), auth);
+    let client = crate::proxy::http_client::get();
+    let req = apply_auth(
+        client
+            .request(Method::DELETE, url)
+            .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS)),
+        auth,
+    );
     let resp = req.send().await.map_err(|e| {
         AppError::Message(with_service_hint(
             url,
@@ -507,64 +494,6 @@ pub async fn delete_collection(url: &str, auth: &WebDavAuth) -> Result<bool, App
     delete_resource(url, auth).await
 }
 
-pub async fn verify_round_trip_readability(
-    base_url: &str,
-    dir_segments: &[String],
-    auth: &WebDavAuth,
-) -> Result<(), AppError> {
-    let probe_name = format!("cc-switch-probe-{}.tmp", Uuid::new_v4());
-    let mut probe_segments = dir_segments.to_vec();
-    probe_segments.push(probe_name);
-    let probe_url = build_remote_url(base_url, &probe_segments)?;
-    let probe_bytes = format!("cc-switch-webdav-probe:{}", Uuid::new_v4()).into_bytes();
-
-    let probe_result = async {
-        put_bytes(
-            &probe_url,
-            auth,
-            probe_bytes.clone(),
-            "application/octet-stream",
-        )
-        .await?;
-
-        verify_readback_matches(base_url, &probe_url, auth, &probe_bytes, "probe").await?;
-
-        Ok(())
-    }
-    .await;
-
-    let cleanup_result = delete_resource(&probe_url, auth).await;
-
-    match probe_result {
-        Ok(()) => {
-            match cleanup_result {
-                Ok(true) => {}
-                Ok(false) => {
-                    log::debug!(
-                        "[WebDAV] Probe cleanup DELETE reported missing after successful round trip: {}",
-                        redact_url(&probe_url)
-                    );
-                }
-                Err(err) => {
-                    log::debug!(
-                        "[WebDAV] Probe cleanup DELETE failed after successful round trip: {}: {err}",
-                        redact_url(&probe_url)
-                    );
-                }
-            }
-            Ok(())
-        }
-        Err(primary_err) => {
-            if let Err(cleanup_err) = cleanup_result {
-                log::debug!(
-                    "[WebDAV] Failed to clean up probe file after probe failure: {cleanup_err}"
-                );
-            }
-            Err(primary_err)
-        }
-    }
-}
-
 pub async fn ensure_remote_directories(
     base_url: &str,
     segments: &[String],
@@ -574,7 +503,8 @@ pub async fn ensure_remote_directories(
     for segment in segments {
         current.push(segment.clone());
         let url = build_remote_url(base_url, &current)?;
-        ensure_single_dir(&url, auth, base_url).await?;
+        let dir_url = collection_url(url)?;
+        ensure_single_dir(&dir_url, auth, base_url).await?;
     }
     Ok(())
 }
@@ -610,7 +540,6 @@ mod tests {
 
     #[test]
     fn build_remote_url_encodes_path_segments() {
-        let base = "https://dav.example.com/remote.php/dav/files/demo";
         let segments = vec![
             "cc switch-sync".to_string(),
             "team a".to_string(),
@@ -618,11 +547,16 @@ mod tests {
             "default profile".to_string(),
             "manifest.json".to_string(),
         ];
-        let url = build_remote_url(base, &segments).expect("build remote url");
-        assert_eq!(
-            url,
-            "https://dav.example.com/remote.php/dav/files/demo/cc%20switch-sync/team%20a/v2/default%20profile/manifest.json"
-        );
+        for base in [
+            "https://dav.example.com/remote.php/dav/files/demo",
+            "https://dav.example.com/remote.php/dav/files/demo/",
+        ] {
+            let url = build_remote_url(base, &segments).expect("build remote url");
+            assert_eq!(
+                url,
+                "https://dav.example.com/remote.php/dav/files/demo/cc%20switch-sync/team%20a/v2/default%20profile/manifest.json"
+            );
+        }
     }
 
     #[test]
@@ -635,6 +569,25 @@ mod tests {
 
         let segs: Vec<&str> = path_segments("").collect();
         assert!(segs.is_empty());
+    }
+
+    #[test]
+    fn collection_url_adds_missing_trailing_slash() {
+        assert_eq!(
+            collection_url("https://dav.example.com/dav/team".to_string())
+                .expect("build collection URL"),
+            "https://dav.example.com/dav/team/"
+        );
+        assert_eq!(
+            collection_url("https://dav.example.com/dav/team/".to_string())
+                .expect("keep collection URL"),
+            "https://dav.example.com/dav/team/"
+        );
+        assert_eq!(
+            collection_url("https://dav.example.com/dav/team%20a?token=secret#section".to_string())
+                .expect("preserve URL components"),
+            "https://dav.example.com/dav/team%20a/?token=secret#section"
+        );
     }
 
     #[test]
@@ -699,6 +652,7 @@ mod tests {
     fn parse_base_url_accepts_https() {
         let url = parse_base_url("https://example.com/dav/").unwrap();
         assert_eq!(url.scheme(), "https");
+        assert_eq!(url.path(), "/dav/");
     }
 
     #[test]

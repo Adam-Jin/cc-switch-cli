@@ -1,56 +1,26 @@
 use super::*;
 use serial_test::serial;
-use std::ffi::OsString;
-use std::path::Path;
 use tempfile::TempDir;
 
-use crate::test_support::{
-    lock_test_home_and_settings, set_test_home_override, TestHomeSettingsLock,
-};
+use crate::test_support::TestEnvGuard;
 
-struct EnvGuard {
-    _lock: TestHomeSettingsLock,
-    old_home: Option<OsString>,
-    old_userprofile: Option<OsString>,
-}
-
-impl EnvGuard {
-    fn set_home(home: &Path) -> Self {
-        let lock = lock_test_home_and_settings();
-        let old_home = std::env::var_os("HOME");
-        let old_userprofile = std::env::var_os("USERPROFILE");
-        std::env::set_var("HOME", home);
-        std::env::set_var("USERPROFILE", home);
-        set_test_home_override(Some(home));
-        crate::settings::reload_test_settings();
-        Self {
-            _lock: lock,
-            old_home,
-            old_userprofile,
-        }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        match &self.old_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
-        }
-        match &self.old_userprofile {
-            Some(value) => std::env::set_var("USERPROFILE", value),
-            None => std::env::remove_var("USERPROFILE"),
-        }
-        set_test_home_override(self.old_home.as_deref().map(Path::new));
-        crate::settings::reload_test_settings();
-    }
+fn third_party_codex_provider(api_key: &str) -> Provider {
+    Provider::with_id(
+        "thirdparty".to_string(),
+        "Third Party".to_string(),
+        json!({
+            "auth": { "OPENAI_API_KEY": api_key },
+            "config": "model_provider = \"custom\"\nmodel = \"gpt-5.2-codex\"\n\n[model_providers.custom]\nbase_url = \"https://api.custom.example/v1\"\nwire_api = \"responses\"\n"
+        }),
+        Some("custom".to_string()),
+    )
 }
 
 #[test]
 #[serial]
 fn switch_codex_provider_writes_stored_config_directly() {
     let temp_home = TempDir::new().expect("create temp home");
-    let _env = EnvGuard::set_home(temp_home.path());
+    let _env = TestEnvGuard::isolated(temp_home.path());
     std::fs::create_dir_all(crate::codex_config::get_codex_config_dir())
         .expect("create ~/.codex (initialized)");
 
@@ -97,7 +67,7 @@ fn switch_codex_provider_writes_stored_config_directly() {
 #[serial]
 fn switch_codex_provider_migrates_legacy_flat_config() {
     let temp_home = TempDir::new().expect("create temp home");
-    let _env = EnvGuard::set_home(temp_home.path());
+    let _env = TestEnvGuard::isolated(temp_home.path());
     std::fs::create_dir_all(crate::codex_config::get_codex_config_dir())
         .expect("create ~/.codex (initialized)");
 
@@ -158,6 +128,269 @@ fn switch_codex_provider_migrates_legacy_flat_config() {
 }
 
 #[test]
+#[serial]
+fn switch_codex_overwrites_config_toml_respecting_auth_mode() {
+    use crate::settings::{update_settings, AppSettings};
+
+    let temp_home = TempDir::new().expect("create temp home");
+    let _env = TestEnvGuard::isolated(temp_home.path());
+    std::fs::create_dir_all(crate::codex_config::get_codex_config_dir())
+        .expect("create ~/.codex (initialized)");
+
+    // With preserve-on-switch enabled, switching to a third-party provider must
+    // NOT clobber an existing ChatGPT OAuth auth.json; the API key rides in
+    // config.toml instead, while config.toml is still a clean overwrite.
+    let previous_settings = crate::settings::get_settings();
+    update_settings(AppSettings {
+        preserve_codex_official_auth_on_switch: true,
+        ..AppSettings::default()
+    })
+    .expect("enable preserve-on-switch");
+
+    let mut config = MultiAppConfig::default();
+    config.ensure_app(&AppType::Codex);
+    {
+        let manager = config
+            .get_manager_mut(&AppType::Codex)
+            .expect("codex manager");
+        manager.providers.insert(
+            "thirdparty".to_string(),
+            Provider::with_id(
+                "thirdparty".to_string(),
+                "Third Party".to_string(),
+                json!({
+                    "auth": { "OPENAI_API_KEY": "sk-thirdparty" },
+                    "config": "model_provider = \"custom\"\nmodel = \"gpt-5.2-codex\"\n\n[model_providers.custom]\nbase_url = \"https://api.custom.example/v1\"\nwire_api = \"responses\"\n"
+                }),
+                Some("custom".to_string()),
+            ),
+        );
+    }
+
+    // Seed an existing ChatGPT OAuth login cache in auth.json.
+    crate::config::write_json_file(
+        &get_codex_auth_path(),
+        &json!({
+            "tokens": { "access_token": "oauth-access-token" },
+            "OPENAI_API_KEY": null
+        }),
+    )
+    .expect("seed live auth.json with OAuth cache");
+
+    let state = state_from_config(config);
+    let result = ProviderService::switch(&state, AppType::Codex, "thirdparty");
+
+    // Restore global settings before asserting so other serial tests are clean.
+    update_settings(previous_settings).expect("restore settings");
+    result.expect("switch should succeed");
+
+    // config.toml is overwritten with the provider's config + the API key as a
+    // bearer token (no auth.json write for third-party while preserving).
+    let config_text =
+        std::fs::read_to_string(get_codex_config_path()).expect("read codex config.toml");
+    assert!(
+        config_text.contains("base_url = \"https://api.custom.example/v1\""),
+        "config.toml should be overwritten with the third-party provider config: {config_text}"
+    );
+    assert!(
+        config_text.contains("experimental_bearer_token"),
+        "third-party API key should ride in config.toml as a bearer token: {config_text}"
+    );
+
+    // The ChatGPT OAuth login cache in auth.json must be preserved untouched.
+    let auth: Value = crate::config::read_json_file(&get_codex_auth_path())
+        .expect("auth.json should still exist");
+    assert_eq!(
+        auth.pointer("/tokens/access_token").and_then(Value::as_str),
+        Some("oauth-access-token"),
+        "preserve-on-switch must not clobber the OAuth auth.json"
+    );
+}
+
+#[test]
+#[serial]
+fn force_sync_codex_third_party_refreshes_auth_when_preserve_is_disabled() {
+    let temp_home = TempDir::new().expect("create temp home");
+    let _env = TestEnvGuard::isolated(temp_home.path());
+    std::fs::create_dir_all(crate::codex_config::get_codex_config_dir())
+        .expect("create ~/.codex (initialized)");
+    crate::settings::set_preserve_codex_official_auth_on_switch(false)
+        .expect("disable preserve-on-switch");
+
+    crate::config::write_json_file(
+        &get_codex_auth_path(),
+        &json!({ "OPENAI_API_KEY": "sk-stale-provider" }),
+    )
+    .expect("seed stale auth.json");
+
+    let provider = third_party_codex_provider("sk-current-provider");
+    ProviderService::write_codex_live_force(&provider, None, false)
+        .expect("force sync should succeed");
+
+    let auth: Value =
+        crate::config::read_json_file(&get_codex_auth_path()).expect("read auth.json");
+    assert_eq!(
+        auth.get("OPENAI_API_KEY").and_then(Value::as_str),
+        Some("sk-current-provider"),
+        "force sync must replace a stale third-party API key"
+    );
+
+    let config_text = std::fs::read_to_string(get_codex_config_path()).expect("read config.toml");
+    assert_eq!(
+        crate::codex_config::extract_codex_experimental_bearer_token(&config_text),
+        None,
+        "preserve disabled must keep the provider API key in auth.json"
+    );
+}
+
+#[test]
+#[serial]
+fn force_sync_codex_third_party_preserves_oauth_when_preserve_is_enabled() {
+    let temp_home = TempDir::new().expect("create temp home");
+    let _env = TestEnvGuard::isolated(temp_home.path());
+    std::fs::create_dir_all(crate::codex_config::get_codex_config_dir())
+        .expect("create ~/.codex (initialized)");
+    crate::settings::set_preserve_codex_official_auth_on_switch(true)
+        .expect("enable preserve-on-switch");
+
+    let preserved_auth = json!({
+        "auth_mode": "chatgpt",
+        "OPENAI_API_KEY": null,
+        "tokens": {
+            "access_token": "oauth-access-token",
+            "account_id": "account-1"
+        }
+    });
+    crate::config::write_json_file(&get_codex_auth_path(), &preserved_auth)
+        .expect("seed OAuth auth.json");
+
+    let provider = third_party_codex_provider("sk-current-provider");
+    ProviderService::write_codex_live_force(&provider, None, false)
+        .expect("force sync should succeed");
+
+    let auth: Value =
+        crate::config::read_json_file(&get_codex_auth_path()).expect("read auth.json");
+    assert_eq!(
+        auth, preserved_auth,
+        "force sync must preserve the official OAuth login"
+    );
+
+    let config_text = std::fs::read_to_string(get_codex_config_path()).expect("read config.toml");
+    assert_eq!(
+        crate::codex_config::extract_codex_experimental_bearer_token(&config_text).as_deref(),
+        Some("sk-current-provider"),
+        "preserve enabled must carry the provider API key in config.toml"
+    );
+}
+
+#[test]
+#[serial]
+fn switch_codex_third_party_discards_stray_chatgpt_oauth_after_login() {
+    // Regression for issue #328: running `codex login` (ChatGPT OAuth) out-of-band
+    // while a third-party provider is active must not leave the ChatGPT login in
+    // auth.json when switching back to the third-party provider. A third-party
+    // provider authenticates with its API key, so switching to/away from it must
+    // never capture or write ChatGPT OAuth material.
+    let temp_home = TempDir::new().expect("create temp home");
+    let _env = TestEnvGuard::isolated(temp_home.path());
+    std::fs::create_dir_all(crate::codex_config::get_codex_config_dir())
+        .expect("create ~/.codex (initialized)");
+
+    let mut config = MultiAppConfig::default();
+    config.ensure_app(&AppType::Codex);
+    {
+        let manager = config
+            .get_manager_mut(&AppType::Codex)
+            .expect("codex manager");
+        manager.providers.insert(
+            "thirdparty".to_string(),
+            Provider::with_id(
+                "thirdparty".to_string(),
+                "Third Party".to_string(),
+                json!({
+                    "auth": { "OPENAI_API_KEY": "sk-thirdparty" },
+                    "config": "model_provider = \"custom\"\nmodel = \"gpt-5.2-codex\"\n\n[model_providers.custom]\nbase_url = \"http://localhost:8317/v1\"\nwire_api = \"responses\"\n"
+                }),
+                Some("custom".to_string()),
+            ),
+        );
+        manager.providers.insert(
+            "official".to_string(),
+            Provider::with_id(
+                "official".to_string(),
+                "OpenAI".to_string(),
+                json!({
+                    "auth": {},
+                    "config": "model_provider = \"openai\"\nmodel = \"gpt-5.2-codex\"\n"
+                }),
+                Some("official".to_string()),
+            ),
+        );
+        manager.current = "thirdparty".to_string();
+    }
+
+    let state = state_from_config(config);
+
+    // Start on the third-party provider (clean api-key auth.json).
+    ProviderService::switch(&state, AppType::Codex, "thirdparty").expect("switch to thirdparty");
+
+    // Simulate `codex login` (ChatGPT) rewriting live auth.json with OAuth material.
+    crate::config::write_json_file(
+        &get_codex_auth_path(),
+        &json!({
+            "auth_mode": "chatgpt",
+            "OPENAI_API_KEY": null,
+            "tokens": { "access_token": "oauth-access-token", "account_id": "acc-1" },
+            "last_refresh": "2026-07-06T00:00:00Z"
+        }),
+    )
+    .expect("simulate codex login (chatgpt)");
+
+    // Switch to official (backfill must not pollute the third-party snapshot),
+    // then back to the third-party.
+    ProviderService::switch(&state, AppType::Codex, "official").expect("switch to official");
+
+    // The stored third-party snapshot must not have captured the ChatGPT OAuth.
+    let stored = state.db.get_all_providers("codex").expect("get providers");
+    let tp = stored.get("thirdparty").expect("thirdparty exists");
+    let tp_auth = tp
+        .settings_config
+        .get("auth")
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert!(
+        tp_auth.pointer("/tokens/access_token").is_none(),
+        "third-party snapshot must not capture ChatGPT OAuth tokens: {tp_auth}"
+    );
+    assert_eq!(
+        tp_auth.get("OPENAI_API_KEY").and_then(Value::as_str),
+        Some("sk-thirdparty"),
+        "third-party snapshot must keep its API key: {tp_auth}"
+    );
+
+    ProviderService::switch(&state, AppType::Codex, "thirdparty")
+        .expect("switch back to thirdparty");
+
+    let auth_final: Value =
+        crate::config::read_json_file(&get_codex_auth_path()).expect("auth.json final");
+    let cfg_final = std::fs::read_to_string(get_codex_config_path()).expect("config.toml final");
+
+    assert!(
+        auth_final.pointer("/tokens/access_token").is_none(),
+        "live auth.json must not retain ChatGPT OAuth tokens after switching to third-party: {auth_final}"
+    );
+    assert_eq!(
+        auth_final.get("OPENAI_API_KEY").and_then(Value::as_str),
+        Some("sk-thirdparty"),
+        "live auth.json must carry the third-party API key: {auth_final}"
+    );
+    assert!(
+        cfg_final.contains("base_url = \"http://localhost:8317/v1\""),
+        "config.toml should point at the third-party endpoint: {cfg_final}"
+    );
+}
+
+#[test]
 fn migrate_legacy_codex_config_noop_for_new_format() {
     let new_format = "model_provider = \"openai\"\nmodel = \"gpt-4o\"\n\n[model_providers.openai]\nbase_url = \"https://api.openai.com/v1\"\nwire_api = \"chat\"\n";
     let provider = Provider::with_id("p1".to_string(), "OpenAI".to_string(), json!({}), None);
@@ -177,12 +410,16 @@ fn migrate_legacy_codex_config_converts_flat_format() {
     let result = super::migrate_legacy_codex_config(legacy, &provider)
         .expect("legacy format should trigger migration");
     assert!(
-        result.contains("model_provider = \"my_provider\""),
-        "should set model_provider from provider id: {result}"
+        result.contains("model_provider = \"custom\""),
+        "should use the stable custom provider bucket: {result}"
     );
     assert!(
-        result.contains("[model_providers.my_provider]"),
-        "should create model_providers section: {result}"
+        result.contains("[model_providers.custom]"),
+        "should create the stable model_providers section: {result}"
+    );
+    assert!(
+        result.contains("name = \"My Provider\""),
+        "should keep the provider display name: {result}"
     );
     assert!(
         result.contains("base_url = \"https://custom.com/v1\""),

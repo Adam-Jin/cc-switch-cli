@@ -7,40 +7,40 @@ use crate::commands::workspace;
 use crate::error::AppError;
 use crate::services::McpService;
 
+use ratatui::prelude::Size;
+
 use super::super::app::visible_prompts;
 use super::super::app::{App, LoadingKind, Overlay, TextViewState, ToastKind};
 use super::super::data::{load_proxy_config, load_state, UiData};
+use super::super::form::{FormFocus, FormState};
 use super::super::runtime_systems::{ProxyReq, RequestTracker};
 
-pub(crate) fn import_mcp_for_current_app_with<FImport, FLoad>(
+pub(crate) fn import_mcp_from_supported_apps_with<FImport, FLoad>(
     app: &mut App,
     data: &mut UiData,
     import: FImport,
     load_data: FLoad,
 ) -> Result<(), AppError>
 where
-    FImport: FnOnce(&AppType) -> Result<usize, AppError>,
+    FImport: FnOnce() -> Result<usize, AppError>,
     FLoad: FnOnce(&AppType) -> Result<UiData, AppError>,
 {
-    let count = import(&app.app_type)?;
+    let count = import()?;
     app.push_toast(texts::tui_toast_mcp_imported(count), ToastKind::Info);
     *data = load_data(&app.app_type)?;
     Ok(())
 }
 
-pub(crate) fn import_mcp_for_current_app(app: &mut App, data: &mut UiData) -> Result<(), AppError> {
-    import_mcp_for_current_app_with(
+pub(crate) fn import_mcp_from_supported_apps(
+    app: &mut App,
+    data: &mut UiData,
+) -> Result<(), AppError> {
+    import_mcp_from_supported_apps_with(
         app,
         data,
-        |app_type| {
+        || {
             let state = load_state()?;
-            match app_type {
-                AppType::Claude => McpService::import_from_claude(&state),
-                AppType::Codex => McpService::import_from_codex(&state),
-                AppType::Gemini => McpService::import_from_gemini(&state),
-                AppType::OpenCode => McpService::import_from_opencode(&state),
-                AppType::OpenClaw => Ok(0),
-            }
+            McpService::import_from_supported_apps(&state)
         },
         UiData::load,
     )
@@ -65,6 +65,7 @@ pub(crate) fn app_display_name(app_type: &AppType) -> &'static str {
         AppType::Codex => "Codex",
         AppType::Gemini => "Gemini",
         AppType::OpenCode => "OpenCode",
+        AppType::Hermes => "Hermes",
         AppType::OpenClaw => "OpenClaw",
     }
 }
@@ -75,6 +76,7 @@ pub(crate) fn queue_managed_proxy_action(
     proxy_loading: &mut RequestTracker,
     app_type: AppType,
     enabled: bool,
+    base_reload_token: super::super::data::UiDataReloadToken,
 ) -> Result<(), AppError> {
     let Some(tx) = proxy_req_tx else {
         app.push_toast(
@@ -99,6 +101,7 @@ pub(crate) fn queue_managed_proxy_action(
         request_id,
         app_type,
         enabled,
+        base_reload_token,
     }) {
         proxy_loading.cancel();
         app.overlay = Overlay::None;
@@ -109,31 +112,6 @@ pub(crate) fn queue_managed_proxy_action(
     }
 
     Ok(())
-}
-
-pub(super) fn refresh_common_snippet_overlay(app: &mut App, data: &UiData) {
-    let Overlay::CommonSnippetView { app_type, view } = &mut app.overlay else {
-        return;
-    };
-
-    let snippet = if app_type == &app.app_type {
-        data.config.common_snippet.clone()
-    } else {
-        data.config
-            .common_snippets
-            .get(app_type)
-            .cloned()
-            .unwrap_or_default()
-    };
-    let snippet = if snippet.trim().is_empty() {
-        texts::tui_default_common_snippet_for_app(app_type.as_str()).to_string()
-    } else {
-        snippet
-    };
-
-    view.title = texts::tui_common_snippet_title(app_type.as_str());
-    view.lines = snippet.lines().map(|s| s.to_string()).collect();
-    view.scroll = 0;
 }
 
 pub(crate) fn run_external_editor_for_current_editor(
@@ -147,6 +125,31 @@ pub(crate) fn run_external_editor_for_current_editor(
     let edited_text = open_external_editor(&current_text)?;
     if let Some(editor) = app.editor.as_mut() {
         editor.replace_text(edited_text);
+    }
+
+    Ok(())
+}
+
+pub(crate) fn run_external_editor_for_prompt_form_content(
+    app: &mut App,
+    open_external_editor: impl FnOnce(&str) -> Result<String, AppError>,
+) -> Result<(), AppError> {
+    let Some(current_text) = app.form.as_ref().and_then(|form| match form {
+        FormState::PromptMeta(prompt) if matches!(prompt.focus, FormFocus::Content) => {
+            Some(prompt.content.text())
+        }
+        _ => None,
+    }) else {
+        return Ok(());
+    };
+
+    let edited_text = open_external_editor(&current_text)?;
+    if let Some(FormState::PromptMeta(prompt)) = app.form.as_mut() {
+        prompt.content.replace_text(edited_text);
+        prompt.content.ensure_cursor_visible(Size {
+            width: 1,
+            height: 1,
+        });
     }
 
     Ok(())
@@ -186,6 +189,7 @@ pub(super) fn refresh_openclaw_daily_memory_search_results(app: &mut App) -> Res
     Ok(())
 }
 
+#[allow(dead_code)]
 pub(super) fn text_view(title: String, content: String) -> Overlay {
     Overlay::TextView(TextViewState {
         title,

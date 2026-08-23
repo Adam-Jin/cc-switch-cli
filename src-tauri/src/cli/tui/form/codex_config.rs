@@ -16,12 +16,13 @@ pub(crate) fn parse_codex_config_snippet(cfg: &str) -> ParsedCodexConfigSnippet 
         Err(_) => return out,
     };
 
+    out.base_url = crate::codex_config::extract_codex_base_url(cfg);
     out.model = table
         .get("model")
         .and_then(|value| value.as_str())
         .map(String::from);
 
-    let section = table
+    let active_section = table
         .get("model_provider")
         .and_then(|value| value.as_str())
         .and_then(|key| {
@@ -31,12 +32,10 @@ pub(crate) fn parse_codex_config_snippet(cfg: &str) -> ParsedCodexConfigSnippet 
                 .and_then(|providers| providers.get(key))
                 .and_then(|value| value.as_table())
         });
+    let provider_settings =
+        active_section.or_else(|| table.get("model_provider").is_none().then_some(&table));
 
-    if let Some(section) = section {
-        out.base_url = section
-            .get("base_url")
-            .and_then(|value| value.as_str())
-            .map(String::from);
+    if let Some(section) = provider_settings {
         out.wire_api = section
             .get("wire_api")
             .and_then(|value| value.as_str())
@@ -65,111 +64,69 @@ pub(crate) fn update_codex_config_snippet(
     requires_openai_auth: bool,
     env_key: &str,
 ) -> String {
-    let mut doc = match original.trim().parse::<toml_edit::DocumentMut>() {
-        Ok(doc) => doc,
-        Err(_) => return original.to_string(),
-    };
-
-    if let Some(model) = non_empty(model) {
-        doc["model"] = toml_edit::value(model);
-    } else {
-        doc.remove("model");
-    }
-
-    let provider_key = doc
-        .get("model_provider")
-        .and_then(|value| value.as_str())
-        .map(|value| value.to_string());
-
-    if let Some(key) = provider_key {
-        if doc.get("model_providers").is_none() {
-            doc["model_providers"] = toml_edit::Item::Table(toml_edit::Table::new());
-        }
-        let providers = doc["model_providers"]
-            .as_table_like_mut()
-            .expect("model_providers should be a table");
-        if providers.get(&key).is_none() {
-            providers.insert(&key, toml_edit::Item::Table(toml_edit::Table::new()));
-        }
-
-        if let Some(section) = providers
-            .get_mut(&key)
-            .and_then(|value| value.as_table_like_mut())
-        {
-            if let Some(base_url) = non_empty(base_url) {
-                section.insert("base_url", toml_edit::value(base_url));
-            } else {
-                section.remove("base_url");
-            }
-
-            section.insert("wire_api", toml_edit::value(wire_api.as_str()));
-            section.insert(
-                "requires_openai_auth",
-                toml_edit::value(requires_openai_auth),
-            );
-
-            if requires_openai_auth {
-                section.remove("env_key");
-            } else {
-                let env_key = non_empty(env_key).unwrap_or("OPENAI_API_KEY");
-                section.insert("env_key", toml_edit::value(env_key));
-            }
-        }
-    }
-
-    let result = doc.to_string();
-    let trimmed = result.trim();
-    if trimmed.is_empty() {
-        String::new()
-    } else {
-        trimmed.to_string()
-    }
+    crate::codex_config::update_codex_config_snippet(
+        original,
+        base_url,
+        model,
+        wire_api.as_str(),
+        requires_openai_auth,
+        env_key,
+    )
 }
 
-pub(crate) fn clean_codex_provider_key(provider_id: &str, provider_name: &str) -> String {
-    let raw = if provider_id.trim().is_empty() {
-        provider_name.trim()
-    } else {
-        provider_id.trim()
-    };
-    crate::codex_config::clean_codex_provider_key(raw)
-}
-
-pub(crate) fn build_codex_provider_config_toml(
-    provider_key: &str,
+pub(crate) fn build_codex_third_party_config_toml(
+    provider_name: &str,
     base_url: &str,
     model: &str,
     wire_api: CodexWireApi,
 ) -> String {
-    let provider_key = escape_toml_string(provider_key);
-    let model = escape_toml_string(model);
-    let base_url = escape_toml_string(base_url);
-
-    [
-        format!("model_provider = \"{}\"", provider_key),
-        format!("model = \"{}\"", model),
-        "model_reasoning_effort = \"high\"".to_string(),
-        "disable_response_storage = true".to_string(),
-        String::new(),
-        format!("[model_providers.{}]", provider_key),
-        format!("name = \"{}\"", provider_key),
-        format!("base_url = \"{}\"", base_url),
-        format!("wire_api = \"{}\"", wire_api.as_str()),
-        "requires_openai_auth = true".to_string(),
-        String::new(),
-    ]
-    .join("\n")
+    crate::codex_config::build_codex_third_party_config_toml(
+        provider_name,
+        base_url,
+        model,
+        wire_api.as_str(),
+    )
 }
 
-fn non_empty(value: &str) -> Option<&str> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_snippet_uses_active_provider_over_stale_root() {
+        let parsed = parse_codex_config_snippet(
+            r#"base_url = "https://stale.example.com/v1"
+model_provider = "current"
+
+[model_providers.current]
+base_url = "https://current.example.com/v1"
+"#,
+        );
+
+        assert_eq!(
+            parsed.base_url.as_deref(),
+            Some("https://current.example.com/v1")
+        );
     }
-}
 
-fn escape_toml_string(value: &str) -> String {
-    value.replace('"', "\\\"")
+    #[test]
+    fn parse_snippet_supports_legacy_flat_base_url() {
+        let parsed = parse_codex_config_snippet(
+            r#"base_url = "https://legacy.example.com/v1"
+model = "gpt-legacy"
+wire_api = "chat"
+requires_openai_auth = false
+env_key = "LEGACY_API_KEY"
+"#,
+        );
+
+        assert_eq!(
+            parsed.base_url.as_deref(),
+            Some("https://legacy.example.com/v1")
+        );
+        assert_eq!(parsed.model.as_deref(), Some("gpt-legacy"));
+        assert_eq!(parsed.wire_api, Some(CodexWireApi::Chat));
+        assert_eq!(parsed.requires_openai_auth, Some(false));
+        assert_eq!(parsed.env_key.as_deref(), Some("LEGACY_API_KEY"));
+    }
 }

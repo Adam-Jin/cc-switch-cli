@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::app_config::{AppType, McpServer, MultiAppConfig};
+use crate::app_config::{AppType, McpApps, McpServer, MultiAppConfig};
 use crate::error::AppError;
 use crate::mcp;
 use crate::store::AppState;
@@ -9,6 +9,17 @@ use crate::store::AppState;
 pub struct McpService;
 
 impl McpService {
+    pub fn supported_mcp_apps() -> impl Iterator<Item = AppType> {
+        [
+            AppType::Claude,
+            AppType::Codex,
+            AppType::Gemini,
+            AppType::OpenCode,
+            AppType::Hermes,
+        ]
+        .into_iter()
+    }
+
     /// 获取所有 MCP 服务器（统一结构）
     pub fn get_all_servers(state: &AppState) -> Result<HashMap<String, McpServer>, AppError> {
         let cfg = state.config.read()?;
@@ -124,8 +135,54 @@ impl McpService {
         Ok(())
     }
 
+    /// Replace the full supported-app matrix for one MCP server.
+    pub fn set_apps(state: &AppState, server_id: &str, apps: McpApps) -> Result<bool, AppError> {
+        let (server, changes) = {
+            let mut cfg = state.config.write()?;
+
+            let Some(servers) = &mut cfg.mcp.servers else {
+                return Ok(false);
+            };
+            let Some(server) = servers.get_mut(server_id) else {
+                return Ok(false);
+            };
+
+            let before = server.apps.clone();
+            server.apps = apps;
+            let server = server.clone();
+            let changes = Self::supported_mcp_apps()
+                .filter_map(|app| {
+                    let before_enabled = before.is_enabled_for(&app);
+                    let after_enabled = server.apps.is_enabled_for(&app);
+                    (before_enabled != after_enabled).then_some((app, after_enabled))
+                })
+                .collect::<Vec<_>>();
+
+            (server, changes)
+        };
+
+        state.save()?;
+
+        for (app, enabled) in changes {
+            if enabled {
+                Self::sync_server_to_app(state, &server, &app)?;
+            } else {
+                Self::remove_server_from_app(state, server_id, &app)?;
+            }
+        }
+
+        Ok(true)
+    }
+
     /// 将 MCP 服务器同步到所有启用的应用
     fn sync_server_to_apps(state: &AppState, server: &McpServer) -> Result<(), AppError> {
+        let labels = crate::machine::current_labels_with(&state.db)?;
+        if !server.machine_selector.matches(&labels) {
+            for app in server.apps.enabled_apps() {
+                Self::remove_server_from_app(state, &server.id, &app)?;
+            }
+            return Ok(());
+        }
         let cfg = state.config.read()?;
 
         for app in server.apps.enabled_apps() {
@@ -163,6 +220,9 @@ impl McpService {
             AppType::OpenCode => {
                 mcp::sync_single_server_to_opencode(cfg, &server.id, &server.server)?;
             }
+            AppType::Hermes => {
+                mcp::sync_single_server_to_hermes(cfg, &server.id, &server.server)?;
+            }
             AppType::OpenClaw => {}
         }
         Ok(())
@@ -187,26 +247,55 @@ impl McpService {
             AppType::Codex => mcp::remove_server_from_codex(id)?,
             AppType::Gemini => mcp::remove_server_from_gemini(id)?,
             AppType::OpenCode => mcp::remove_server_from_opencode(id)?,
+            AppType::Hermes => mcp::remove_server_from_hermes(id)?,
             AppType::OpenClaw => {}
         }
         Ok(())
     }
 
-    /// 手动同步所有启用的 MCP 服务器到对应的应用
+    /// 手动同步所有启用的 MCP 服务器到对应的应用。
+    ///
+    /// Best-effort：单个应用投影失败不阻断其余应用。各应用的 live 文件互相独立，
+    /// 一处损坏没有理由让其它应用的 MCP 状态保持陈旧。全部执行完后聚合错误，
+    /// 保留调用方对部分失败的可见性。
     pub fn sync_all_enabled(state: &AppState) -> Result<(), AppError> {
         let servers = Self::get_all_servers(state)?;
-
-        for app in AppType::all() {
-            if matches!(app, AppType::OpenClaw) {
-                continue;
+        let mut failures = Vec::new();
+        for app in Self::supported_mcp_apps() {
+            if let Err(err) = Self::project_servers_to_app(state, &servers, &app) {
+                log::warn!("同步 MCP 到 {app:?} 失败: {err}");
+                failures.push(format!("{}: {err}", app.as_str()));
             }
+        }
 
-            for server in servers.values() {
-                if server.apps.is_enabled_for(&app) {
-                    Self::sync_server_to_app(state, server, &app)?;
-                } else {
-                    Self::remove_server_from_app(state, &server.id, &app)?;
-                }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(AppError::Message(format!(
+                "部分应用 MCP 同步失败: {}",
+                failures.join("; ")
+            )))
+        }
+    }
+
+    /// 只把启用状态投影到单个应用。某个应用的 live 被整体重写后用它做
+    /// 定向重投影，避免把无关应用的失败面牵连进目标应用的关键路径。
+    pub fn sync_enabled_for_app(state: &AppState, app: &AppType) -> Result<(), AppError> {
+        let servers = Self::get_all_servers(state)?;
+        Self::project_servers_to_app(state, &servers, app)
+    }
+
+    fn project_servers_to_app(
+        state: &AppState,
+        servers: &HashMap<String, McpServer>,
+        app: &AppType,
+    ) -> Result<(), AppError> {
+        let labels = crate::machine::current_labels_with(&state.db)?;
+        for server in servers.values() {
+            if server.apps.is_enabled_for(app) && server.machine_selector.matches(&labels) {
+                Self::sync_server_to_app(state, server, app)?;
+            } else {
+                Self::remove_server_from_app(state, &server.id, app)?;
             }
         }
 
@@ -295,5 +384,24 @@ impl McpService {
         drop(cfg);
         state.save()?;
         Ok(count)
+    }
+
+    /// 从 Hermes 导入 MCP
+    pub fn import_from_hermes(state: &AppState) -> Result<usize, AppError> {
+        let mut cfg = state.config.write()?;
+        let count = mcp::import_from_hermes(&mut cfg)?;
+        drop(cfg);
+        state.save()?;
+        Ok(count)
+    }
+
+    pub fn import_from_supported_apps(state: &AppState) -> Result<usize, AppError> {
+        let mut total = 0;
+        total += Self::import_from_claude(state)?;
+        total += Self::import_from_codex(state)?;
+        total += Self::import_from_gemini(state)?;
+        total += Self::import_from_opencode(state)?;
+        total += Self::import_from_hermes(state)?;
+        Ok(total)
     }
 }

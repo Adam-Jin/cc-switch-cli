@@ -115,8 +115,14 @@ fn sync_codex_provider_writes_auth_and_config() {
 
     assert!(
         auth_path.exists(),
-        "auth.json should exist at {}",
+        "auth.json should be refreshed by third-party provider sync at {}",
         auth_path.display()
+    );
+    let auth: serde_json::Value = read_json_file(&auth_path).expect("read auth.json");
+    assert_eq!(
+        auth.get("OPENAI_API_KEY").and_then(|value| value.as_str()),
+        Some("codex-key"),
+        "forced sync should write the current provider API key"
     );
     assert!(
         config_path.exists(),
@@ -124,16 +130,14 @@ fn sync_codex_provider_writes_auth_and_config() {
         config_path.display()
     );
 
-    let auth_value: serde_json::Value = read_json_file(&auth_path).expect("read auth");
-    assert_eq!(
-        auth_value,
-        provider_config.get("auth").cloned().expect("auth object")
-    );
-
     let toml_text = fs::read_to_string(&config_path).expect("read config.toml");
     assert!(
         toml_text.contains("command = \"echo\""),
         "config.toml should contain serialized enabled MCP server"
+    );
+    assert!(
+        !toml_text.contains("experimental_bearer_token"),
+        "preserve disabled should keep the provider key in auth.json"
     );
 
     // 当前供应商应同步最新 config 文本
@@ -144,11 +148,14 @@ fn sync_codex_provider_writes_auth_and_config() {
         .get("config")
         .and_then(|v| v.as_str())
         .expect("config string");
-    assert_eq!(synced_cfg, toml_text);
+    assert!(
+        !synced_cfg.contains("experimental_bearer_token"),
+        "provider storage should not persist generated live bearer token"
+    );
 }
 
 #[test]
-fn sync_codex_provider_preserves_live_model_provider_id_for_history() {
+fn sync_codex_provider_preserves_provider_model_provider_after_history_migration() {
     let _guard = lock_test_mutex();
     reset_test_fs();
 
@@ -202,21 +209,17 @@ requires_openai_auth = true
 
     assert_eq!(
         parsed.get("model_provider").and_then(|v| v.as_str()),
-        Some("rightcode"),
-        "legacy ConfigService sync should keep the stable live provider id"
+        Some("aihubmix"),
+        "ConfigService sync should preserve the provider template's model_provider"
     );
 
     let model_providers = parsed
         .get("model_providers")
         .and_then(|v| v.as_table())
         .expect("model_providers should exist");
-    assert!(
-        model_providers.get("aihubmix").is_none(),
-        "provider-specific target id should not be written to live config"
-    );
     assert_eq!(
         model_providers
-            .get("rightcode")
+            .get("aihubmix")
             .and_then(|v| v.get("base_url"))
             .and_then(|v| v.as_str()),
         Some("https://aihubmix.example/v1")
@@ -229,8 +232,8 @@ requires_openai_auth = true
         .and_then(|v| v.as_str())
         .expect("synced config string");
     assert!(
-        synced_cfg.contains("[model_providers.rightcode]"),
-        "ConfigService keeps syncing provider config from live"
+        synced_cfg.contains("[model_providers.aihubmix]"),
+        "ConfigService keeps syncing provider-specific config from live"
     );
 }
 
