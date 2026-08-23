@@ -9882,6 +9882,22 @@ mod tests {
     }
 
     #[test]
+    fn global_webdav_shortcuts_download_and_upload() {
+        let mut app = App::new(Some(AppType::Claude));
+        app.route = Route::Settings;
+        let data = UiData::default();
+
+        assert!(matches!(
+            app.on_key(key(KeyCode::Char('g')), &data),
+            Action::ConfigWebDavDownload
+        ));
+        assert!(matches!(
+            app.on_key(key(KeyCode::Char('G')), &data),
+            Action::ConfigWebDavUpload
+        ));
+    }
+
+    #[test]
     fn main_proxy_action_stops_and_restores_current_app_when_active() {
         let mut app = App::new(Some(AppType::Claude));
         app.route = Route::Main;

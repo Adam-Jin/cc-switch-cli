@@ -868,6 +868,14 @@ impl App {
             KeyCode::Char('q') | KeyCode::Esc => {
                 return self.on_back_key();
             }
+            // Global WebDAV snapshot transfer shortcuts. Keep these outside
+            // route-specific handlers so they remain available from any page.
+            KeyCode::Char('g') => {
+                return Action::ConfigWebDavDownload;
+            }
+            KeyCode::Char('G') => {
+                return Action::ConfigWebDavUpload;
+            }
             _ => {}
         }
 
